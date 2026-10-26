@@ -1679,6 +1679,20 @@ impl PeerConnection {
             }
         }
         *self.inner.local_description.lock() = Some(desc);
+        // The answerer starts gathering in set_remote_description (JSEP,
+        // RFC 9429, starts it at setLocalDescription), so it can complete
+        // before this: the gathering loop then found no local description to
+        // put the candidates in, yet gathering reads as complete. Fill them in
+        // here - JSEP and W3C webrtc-pc have the local description carry the
+        // candidates gathered so far, and complete gathering mean they're all
+        // in it. Otherwise an answer created before gathering got anywhere
+        // goes out without candidates, and with no trickle to follow
+        // (RFC 8838/8840) the peer has nothing to check. Gathering that
+        // completes later is filled in by the gathering loop.
+        let ice_transport = &self.inner.ice_transport;
+        if *ice_transport.subscribe_gathering_state().borrow() == IceGathererState::Complete {
+            update_local_description_on_gather(&self.inner, ice_transport);
+        }
         if applies_answer {
             self.apply_negotiated_send_directions();
         }
@@ -9778,6 +9792,54 @@ mod tests {
             SignalingState::Stable,
             "final answer must complete negotiation"
         );
+    }
+
+    /// The answerer gathers from set_remote_description on. Gathering that
+    /// completes after create_answer but before set_local_description must
+    /// still land in the local answer: JSEP (RFC 9429) and W3C webrtc-pc
+    /// have the local description carry the candidates gathered so far.
+    #[tokio::test]
+    async fn answer_gets_candidates_gathered_before_local_description() {
+        let offerer = PeerConnection::new(RtcConfiguration::default());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = offerer.create_offer().await.unwrap();
+
+        let callee = PeerConnection::new(RtcConfiguration::default());
+        callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        callee.set_remote_description(offer).await.unwrap();
+
+        // an answer created before gathering got anywhere
+        let mut answer = callee.create_answer().await.unwrap();
+        for section in answer.media_sections.iter_mut() {
+            section
+                .attributes
+                .retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+        }
+
+        // gathering completes with no local description set yet
+        let mut gathering = callee.inner.ice_transport.subscribe_gathering_state();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *gathering.borrow_and_update() != IceGathererState::Complete {
+                gathering.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("gathering did not complete");
+        // let the gathering loop act on it
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        callee.set_local_description(answer).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), callee.wait_for_gathering_complete())
+            .await
+            .expect("gathering never reported complete");
+
+        let local = callee.local_description().unwrap();
+        let candidates = local.media_sections[0]
+            .attributes
+            .iter()
+            .filter(|a| a.key == "candidate")
+            .count();
+        assert!(candidates >= 1, "answer went out without candidates");
     }
 
     #[tokio::test]
