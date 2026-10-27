@@ -1,4 +1,5 @@
 pub mod conn;
+pub use conn::SourceChange;
 #[cfg(feature = "std")] // mDNS is excluded from the embedded target
 pub mod mdns;
 #[cfg(feature = "std")] // ICE-TCP is excluded from the embedded target

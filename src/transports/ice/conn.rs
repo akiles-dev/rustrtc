@@ -5,6 +5,7 @@ use crate::platform::sync::OnceLock;
 use crate::platform::sync::{Mutex, RwLock};
 use crate::platform::sync::{mpsc, watch};
 use crate::platform::task;
+use crate::platform::time::Instant;
 use crate::prelude::*;
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use crate::transports::PacketReceiver;
@@ -16,38 +17,23 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use serde_json::json;
 use tracing::{debug, trace, warn};
 
-/// Per-source-address state tracked during the latching probation period.
+/// Per-source state observed during the initial-latch probation: a stale
+/// NAT binding or port glitch may deliver a few packets from the wrong
+/// source before the real stream settles.  Identity is `ip:port + SSRC`;
+/// a candidate earns credit only for packets carrying its own SSRC.
 ///
-/// After `enable_latch_on_rtp()` is called, the first few RTP packets from
-/// potentially multiple source ports are observed before committing to a
-/// remote address.  This handles the common case where a stale NAT binding
-/// or a brief port-glitch delivers one or two packets from the wrong port
-/// before the real media stream settles.
-///
-/// Decision rules (evaluated in order on every new RTP packet):
-///
-/// 1. **Marker flush**: a candidate that has sent a packet with `marker=true`
-///    and has the lowest `first_seq` among candidates with a marker is
-///    selected immediately — the marker bit signals the first packet of a
-///    talkspurt and is a strong indicator of the real source.
-/// 2. **Consecutive dominance**: a candidate with `consecutive_count >= 2`
-///    that also has accumulated `>= 3` total packets across all observed
-///    candidates is selected.  Two sequential packets from the same port is
-///    a reliable signal.
-/// 3. **Timeout fallback**: after observing `max_packets` RTP
-///    packets without a clear winner, the candidate with the highest
-///    `packet_count` wins (ties broken by lowest `first_seq`).
-///
-/// Once latched the `probation` field is set to `None` so the `Mutex` is
-/// never locked again during the steady-state forwarding path.
+/// Winner rules: consecutive dominance (`consecutive_count >= 2`, i.e. 3
+/// packets in a row, once `>= 3` total observed) or, after `max_packets`
+/// observations, the timeout fallback (most packets; ties by marker, then
+/// earliest `first_seq` in wrapping order).  No single packet — marker or
+/// not — can move the egress address.
 #[derive(Debug)]
 struct RtpCandidateState {
     addr: SocketAddr,
-    #[allow(dead_code)]
+    /// SSRC this candidate was first seen with; the candidate identity.
     ssrc: u32,
     first_seq: u16,
     last_seq: u16,
-    first_ts: u32,
     packet_count: u8,
     /// Number of RTP packets received with `seq == last_seq + 1`.
     consecutive_count: u8,
@@ -62,6 +48,85 @@ struct RtpProbationState {
     /// Maximum total observed packets before forcing a decision
     /// (≈ 80 ms at 20 ms ptime when set to 6).
     max_packets: u8,
+}
+
+// ── Competitive re-latch (steady-state source migration) ─────────────
+//
+// After the initial latch, a different source takes over the egress path
+// only after `RELATCH_PACKETS` consecutive-sequence packets carrying one
+// SSRC inside `RELATCH_WINDOW_MS` — the sanctioned path for legitimate
+// NAT rebinding.  Persistence is accident-robustness, not a security
+// boundary: sustained on-path injection is left to deployment and future
+// crypto fast-paths (STUN MIC / SRTP auth).
+
+/// Consecutive-sequence packets (same SSRC) a new source must show before a
+/// competitive re-latch commits (≈ 80 ms at 20 ms ptime).
+const RELATCH_PACKETS: u8 = 4;
+/// A probe that has not reached `RELATCH_PACKETS` within this window is
+/// discarded (a straggler, not a live flow).
+const RELATCH_WINDOW_MS: u64 = 2_000;
+/// After a re-latch commits, further probes are suppressed for this long
+/// (anti flapping / ping-pong between paths).
+const RELATCH_COOLDOWN_MS: u64 = 10_000;
+/// Maximum competitive re-latches per session; beyond this the address is
+/// frozen until signaling retargets it.
+const RELATCH_MAX_SWITCHES: u8 = 4;
+/// Non-mux RTCP latching also requires repetition — one packet must not
+/// move the RTCP destination.
+const RTCP_LATCH_PACKETS: u8 = 2;
+
+/// Probe state for a source address competing to take over the latched
+/// egress path; identity is `addr + ssrc`.
+#[derive(Debug)]
+struct RelatchProbe {
+    addr: SocketAddr,
+    ssrc: u32,
+    last_seq: u16,
+    consecutive: u8,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+}
+
+impl RelatchProbe {
+    fn new(addr: SocketAddr, ssrc: u32, seq: u16, now_ms: u64) -> Self {
+        Self {
+            addr,
+            ssrc,
+            last_seq: seq,
+            consecutive: 1,
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+        }
+    }
+}
+
+/// True when RTP sequence `seq` immediately follows `prev` (wrapping-aware).
+fn seq_is_next(prev: u16, seq: u16) -> bool {
+    seq == prev.wrapping_add(1)
+}
+
+/// True when RTP sequence number `a` precedes `b` in 16-bit wrapping order
+/// (`a` is the older/newer-towards-wrap side).  Plain `<` breaks at the
+/// 0xFFFF → 0x0000 wrap.
+fn seq_before(a: u16, b: u16) -> bool {
+    let d = a.wrapping_sub(b);
+    d != 0 && d >= 0x8000
+}
+
+/// Emitted when the RTP remote source (egress destination) changes: the
+/// initial latch commit (`switch == 0`) or a competitive re-latch
+/// (`switch >= 1`).  Delivered to the upper layer through the channel
+/// installed with [`IceConn::set_source_change_sender`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceChange {
+    /// Remote address media was being sent to before the change.
+    pub from: SocketAddr,
+    /// Newly committed remote address.
+    pub to: SocketAddr,
+    /// RTP SSRC that drove the decision.
+    pub ssrc: u32,
+    /// 0 = initial latch, 1.. = nth competitive re-latch this session.
+    pub switch: u8,
 }
 
 pub struct IceConn {
@@ -101,6 +166,29 @@ pub struct IceConn {
     /// Maximum packets to observe during probation.  `0` means "no probation"
     /// — first SSRC-matching RTP latches immediately (legacy behaviour).
     probation_max_packets: AtomicU8,
+    /// Steady-state competitive re-latch probe for a new source address.
+    /// `Some` while a candidate is accumulating the consecutive packets
+    /// required to take over the latched egress path, `None` otherwise.
+    relatch_probe: Mutex<Option<RelatchProbe>>,
+    /// Cheap gate so the steady-state inbound path never locks the probe
+    /// mutex: `true` iff `relatch_probe` is `Some`.
+    probe_active: AtomicBool,
+    /// Monotonic ms of the last committed re-latch (cooldown basis), 0 = never.
+    last_relatch_ms: AtomicU64,
+    /// Committed competitive re-latches this session.
+    relatch_count: AtomicU8,
+    /// Upper-layer sink for [`SourceChange`] notifications (latch commits).
+    source_change_tx: Mutex<Option<mpsc::UnboundedSender<SourceChange>>>,
+    /// Two-packet hysteresis for non-mux RTCP latching (addr, packets seen).
+    rtcp_probe: Mutex<Option<(SocketAddr, u8)>>,
+    /// Warn-once flag for the exhausted re-latch budget.
+    relatch_budget_warned: AtomicBool,
+    /// Construction time — origin of the monotonic ms clock used by the
+    /// re-latch windows (no_std-safe: logical clock via `platform::time`).
+    created: Instant,
+    /// Added to `created.elapsed()` by tests to jump past cooldowns and
+    /// windows without sleeping in real time.
+    clock_offset_ms: AtomicU64,
     /// Lazily-initialised queue for transports without a synchronous send
     /// (TURN / TCP / TLS): the RTP bridge fast-path hands packets here and a
     /// spawned task drains them through the async `send_to`. Without this the
@@ -149,6 +237,15 @@ impl IceConn {
             tx_bytes: AtomicU64::new(0),
             probation: Mutex::new(None),
             probation_max_packets: AtomicU8::new(probation_max_packets.unwrap_or(0)),
+            relatch_probe: Mutex::new(None),
+            probe_active: AtomicBool::new(false),
+            last_relatch_ms: AtomicU64::new(0),
+            relatch_count: AtomicU8::new(0),
+            source_change_tx: Mutex::new(None),
+            rtcp_probe: Mutex::new(None),
+            relatch_budget_warned: AtomicBool::new(false),
+            created: Instant::now(),
+            clock_offset_ms: AtomicU64::new(0),
             deferred_send_tx: OnceLock::new(),
         })
     }
@@ -156,6 +253,289 @@ impl IceConn {
     pub fn set_probation_max_packets(&self, max: Option<u8>) {
         self.probation_max_packets
             .store(max.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Install the upper-layer sink for [`SourceChange`] notifications.
+    /// Called by the `PeerConnection` when it wires up this connection; the
+    /// events are delivered to the registered `RtpObserver`s via
+    /// `RtpObserver::on_source_change`.
+    pub fn set_source_change_sender(&self, tx: mpsc::UnboundedSender<SourceChange>) {
+        *self.source_change_tx.lock() = Some(tx);
+    }
+
+    /// Number of competitive re-latches committed so far this session.
+    pub fn relatch_count(&self) -> u8 {
+        self.relatch_count.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic milliseconds relative to construction (no_std-safe: the
+    /// logical clock from `platform::time`), plus the test clock offset.
+    /// Deliberately never 0 — 0 is the "never" sentinel for
+    /// `last_relatch_ms` (a fresh test connection observes at t≈0).
+    fn now_ms(&self) -> u64 {
+        self.created.elapsed().as_millis() as u64 + self.clock_offset_ms.load(Ordering::Relaxed) + 1
+    }
+
+    /// Test-only: advance the re-latch clock past cooldowns / windows
+    /// without sleeping in real time.
+    #[cfg(test)]
+    pub(crate) fn test_advance_clock_ms(&self, ms: u64) {
+        self.clock_offset_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Emit a source-change notification to the upper layer (best effort —
+    /// a missing/unreachable sink never affects the media path).
+    fn notify_source_change(&self, from: SocketAddr, to: SocketAddr, ssrc: u32, switch: u8) {
+        if let Some(tx) = self.source_change_tx.lock().as_ref() {
+            let _ = tx.send(SourceChange {
+                from,
+                to,
+                ssrc,
+                switch,
+            });
+        }
+    }
+
+    /// Commit an egress destination: set the remote, mark latched, notify
+    /// observers.  `switch` is 0 for the initial latch, 1.. for re-latches.
+    fn commit_latch(&self, from: SocketAddr, to: SocketAddr, ssrc: u32, switch: u8, reason: &str) {
+        if to != from {
+            *self.remote_addr.write() = to;
+        }
+        self.rtp_latched.store(true, Ordering::Relaxed);
+        tracing::info!("IceConn: RTP latched to {} ({})", to, reason);
+        self.notify_source_change(from, to, ssrc, switch);
+    }
+
+    /// Pre-latch probation: attribute the packet to a candidate source and
+    /// pick a winner once persistence or the observation budget says so.
+    /// Thresholds favour availability pre-latch (3 packets in a row) over
+    /// post-latch defence (4, see `RELATCH_PACKETS`).
+    fn latch_probation(
+        &self,
+        addr: SocketAddr,
+        pkt_ssrc: u32,
+        seq: u16,
+        marker: bool,
+        expected: u32,
+    ) {
+        let current_remote = *self.remote_addr.read();
+        let mut probation_guard = self.probation.lock();
+        if let Some(ref mut prob) = *probation_guard {
+            let pos = prob.candidates.iter().position(|c| c.addr == addr);
+            let mut credited = true;
+            match pos {
+                Some(i) => {
+                    let c = &mut prob.candidates[i];
+                    // Identity is ip:port + SSRC: a drifted SSRC earns no
+                    // credit and does not advance the probation budget.
+                    if pkt_ssrc != c.ssrc {
+                        credited = false;
+                    } else {
+                        if seq_is_next(c.last_seq, seq) {
+                            c.consecutive_count = c.consecutive_count.saturating_add(1);
+                        } else {
+                            // Non-sequential — reset run
+                            c.consecutive_count = 0;
+                        }
+                        c.last_seq = seq;
+                        c.packet_count = c.packet_count.saturating_add(1);
+                        if marker {
+                            c.has_marker = true;
+                        }
+                        if seq_before(seq, c.first_seq) {
+                            c.first_seq = seq;
+                        }
+                    }
+                }
+                None => {
+                    prob.candidates.push(RtpCandidateState {
+                        addr,
+                        ssrc: pkt_ssrc,
+                        first_seq: seq,
+                        last_seq: seq,
+                        packet_count: 1,
+                        consecutive_count: 0,
+                        has_marker: marker,
+                    });
+                }
+            }
+
+            if !credited {
+                return;
+            }
+
+            prob.total_packets = prob.total_packets.saturating_add(1);
+            let total = prob.total_packets;
+            let winner: Option<SocketAddr> = if total >= prob.max_packets {
+                // Timeout fallback: the candidate with the most packets
+                // wins; ties broken by marker, then by earliest first_seq
+                // in wrapping order.
+                prob.candidates
+                    .iter()
+                    .max_by(|a, b| {
+                        a.packet_count
+                            .cmp(&b.packet_count)
+                            .then(a.has_marker.cmp(&b.has_marker))
+                            .then_with(|| {
+                                if seq_before(b.first_seq, a.first_seq) {
+                                    // a starts earlier → a ranks higher
+                                    core::cmp::Ordering::Greater
+                                } else if seq_before(a.first_seq, b.first_seq) {
+                                    core::cmp::Ordering::Less
+                                } else {
+                                    core::cmp::Ordering::Equal
+                                }
+                            })
+                    })
+                    .map(|c| c.addr)
+            } else if total >= 3 {
+                // Consecutive dominance: at least 2 consecutive packets
+                // from one source and at least 3 total observed.  A marker
+                // packet alone is deliberately not enough — persistence
+                // is required before the egress address moves.
+                prob.candidates
+                    .iter()
+                    .find(|c| c.consecutive_count >= 2)
+                    .map(|c| c.addr)
+            } else {
+                None
+            };
+
+            if let Some(win_addr) = winner {
+                // Drop the probation state so the steady-state path never
+                // locks this Mutex again.
+                *probation_guard = None;
+                drop(probation_guard);
+                self.commit_latch(
+                    current_remote,
+                    win_addr,
+                    pkt_ssrc,
+                    0,
+                    &format!("probation, expected_ssrc={expected}, observed={total}"),
+                );
+            }
+        } else {
+            // No probation state — immediate latch (legacy path).
+            self.commit_latch(
+                current_remote,
+                addr,
+                pkt_ssrc,
+                0,
+                &format!("immediately, expected_ssrc={expected}"),
+            );
+        }
+    }
+
+    /// Steady-state observation for the competitive re-latch, called for
+    /// every SSRC-matching RTP packet once the initial latch has committed.
+    /// A new source takes over only after `RELATCH_PACKETS` consecutive
+    /// packets carrying one SSRC inside the probe window; the incumbent's
+    /// packets reset the probe.
+    fn observe_relatch(&self, addr: SocketAddr, ssrc: u32, seq: u16) {
+        let current = *self.remote_addr.read();
+
+        if addr == current {
+            // Hot path: gate on the flag so incumbents never lock the probe.
+            if self.probe_active.swap(false, Ordering::Relaxed)
+                && self.relatch_probe.lock().take().is_some()
+            {
+                tracing::debug!("IceConn: re-latch probe cleared — incumbent source alive");
+            }
+            return;
+        }
+
+        let now = self.now_ms();
+
+        // Budget: past the switch cap the egress address is frozen until
+        // signaling retargets it (reset_latch).
+        let switches = self.relatch_count.load(Ordering::Relaxed);
+        if switches >= RELATCH_MAX_SWITCHES {
+            if !self.relatch_budget_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "IceConn: RTP from {} ignored — re-latch budget exhausted \
+                     ({}/{} switches); signaling required to retarget",
+                    addr, switches, RELATCH_MAX_SWITCHES
+                );
+            }
+            return;
+        }
+
+        // Cooldown: suppress flapping right after a committed switch.
+        let last = self.last_relatch_ms.load(Ordering::Relaxed);
+        if last != 0 {
+            let since = now.saturating_sub(last);
+            if since < RELATCH_COOLDOWN_MS {
+                tracing::debug!(
+                    "IceConn: re-latch probe from {} suppressed by cooldown \
+                     ({} ms left)",
+                    addr,
+                    RELATCH_COOLDOWN_MS - since
+                );
+                return;
+            }
+        }
+
+        let mut guard = self.relatch_probe.lock();
+        let run_advanced = match guard.as_mut() {
+            Some(p) if p.addr == addr && p.ssrc == ssrc => {
+                if now.saturating_sub(p.first_seen_ms) > RELATCH_WINDOW_MS {
+                    // Stale probe (a trickle, not a live flow) — restart.
+                    *p = RelatchProbe::new(addr, ssrc, seq, now);
+                    false
+                } else if seq_is_next(p.last_seq, seq) {
+                    p.last_seq = seq;
+                    p.last_seen_ms = now;
+                    p.consecutive = p.consecutive.saturating_add(1);
+                    true
+                } else {
+                    // Out-of-order / retransmission — the run restarts.
+                    p.last_seq = seq;
+                    p.last_seen_ms = now;
+                    p.consecutive = 1;
+                    false
+                }
+            }
+            _ => {
+                // New contender.  Identity is addr+SSRC, so a source whose
+                // SSRC drifts keeps restarting its probe.
+                *guard = Some(RelatchProbe::new(addr, ssrc, seq, now));
+                self.probe_active.store(true, Ordering::Relaxed);
+                tracing::debug!(
+                    "IceConn: re-latch probe started from {} (ssrc={}, need {} consecutive)",
+                    addr, ssrc, RELATCH_PACKETS
+                );
+                false
+            }
+        };
+
+        if !run_advanced {
+            return;
+        }
+        let commit = {
+            let p = guard.as_ref().expect("probe just updated");
+            p.consecutive >= RELATCH_PACKETS
+        };
+        if commit {
+            let (probe_addr, probe_ssrc) = {
+                let p = guard.as_ref().expect("probe just updated");
+                (p.addr, p.ssrc)
+            };
+            *guard = None;
+            drop(guard);
+            self.probe_active.store(false, Ordering::Relaxed);
+            self.last_relatch_ms.store(now, Ordering::Relaxed);
+            let switch = self.relatch_count.fetch_add(1, Ordering::Relaxed) + 1;
+            self.commit_latch(
+                current,
+                probe_addr,
+                probe_ssrc,
+                switch,
+                &format!(
+                    "re-latch, {RELATCH_PACKETS} consecutive, switch {switch}/{RELATCH_MAX_SWITCHES}"
+                ),
+            );
+        }
     }
 
     /// Record that the first outbound RTP was written to the wire. Called by
@@ -220,6 +600,7 @@ impl IceConn {
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
         *self.remote_rtcp_addr.write() = addr;
         self.rtcp_latched.store(false, Ordering::Relaxed);
+        self.rtcp_probe.lock().take();
     }
 
     /// Returns the local socket address (the bind address of the current
@@ -274,10 +655,17 @@ impl IceConn {
     }
 
     /// Reset latching state before applying a remote SDP so a new source can
-    /// be selected. Clears both the latch flag and any in-progress probation.
+    /// be selected. Clears both the latch flag and any in-progress probation,
+    /// plus the re-latch probe, RTCP probe and cooldown (a fresh negotiation
+    /// starts a fresh media path; the switch budget stays session-scoped).
     pub fn reset_latch(&self) {
         self.rtp_latched.store(false, Ordering::Relaxed);
         self.rtcp_latched.store(false, Ordering::Relaxed);
+        self.relatch_probe.lock().take();
+        self.probe_active.store(false, Ordering::Relaxed);
+        self.rtcp_probe.lock().take();
+        self.last_relatch_ms.store(0, Ordering::Relaxed);
+        self.relatch_budget_warned.store(false, Ordering::Relaxed);
         let max = self.probation_max_packets.load(Ordering::Relaxed);
         *self.probation.lock() = if self.latch_on_rtp.load(Ordering::Relaxed) && max > 0 {
             Some(RtpProbationState {
@@ -578,16 +966,32 @@ impl PacketReceiver for IceConn {
             if self.latch_on_rtp.load(Ordering::Relaxed) {
                 if is_rtcp {
                     // RTCP may teach the RTCP destination in non-mux mode, but it must
-                    // never override the RTP remote address.
+                    // never override the RTP remote address.  A *new* RTCP source must
+                    // repeat itself before taking over — one packet must not move
+                    // the destination.
                     let mut remote_rtcp_addr = self.remote_rtcp_addr.write();
                     if let Some(current_rtcp_remote) = *remote_rtcp_addr
                         && addr != current_rtcp_remote
                         && !self.rtcp_latched.load(Ordering::Relaxed)
                     {
-                        *remote_rtcp_addr = Some(addr);
-                        self.rtcp_latched.store(true, Ordering::Relaxed);
+                        let mut probe = self.rtcp_probe.lock();
+                        let seen = match *probe {
+                            Some((seen_addr, n)) if seen_addr == addr => n + 1,
+                            _ => 1,
+                        };
+                        if seen >= RTCP_LATCH_PACKETS {
+                            *remote_rtcp_addr = Some(addr);
+                            self.rtcp_latched.store(true, Ordering::Relaxed);
+                            *probe = None;
+                            tracing::debug!(
+                                "IceConn: RTCP latched to {} after {} packets",
+                                addr, seen
+                            );
+                        } else {
+                            *probe = Some((addr, seen));
+                        }
                     }
-                } else if !self.rtp_latched.load(Ordering::Relaxed) && packet.len() >= 12 {
+                } else if packet.len() >= 12 {
                     let expected = self.expected_ssrc.load(Ordering::Relaxed);
                     let pkt_ssrc =
                         u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
@@ -596,118 +1000,16 @@ impl PacketReceiver for IceConn {
 
                     if ssrc_ok {
                         let seq = u16::from_be_bytes([packet[2], packet[3]]);
-                        let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
                         let marker = (packet[1] & 0x80) != 0;
 
-                        let mut probation_guard = self.probation.lock();
-                        if let Some(ref mut prob) = *probation_guard {
-                            prob.total_packets = prob.total_packets.saturating_add(1);
-
-                            let pos = prob.candidates.iter().position(|c| c.addr == addr);
-                            if let Some(i) = pos {
-                                let c = &mut prob.candidates[i];
-                                if seq == c.last_seq.wrapping_add(1) {
-                                    c.consecutive_count = c.consecutive_count.saturating_add(1);
-                                } else {
-                                    // Non-sequential — reset run
-                                    c.consecutive_count = 0;
-                                }
-                                c.last_seq = seq;
-                                c.packet_count = c.packet_count.saturating_add(1);
-                                if marker {
-                                    c.has_marker = true;
-                                }
-                                if ts < c.first_ts {
-                                    c.first_ts = ts;
-                                }
-                                if seq < c.first_seq {
-                                    c.first_seq = seq;
-                                }
-                            } else {
-                                prob.candidates.push(RtpCandidateState {
-                                    addr,
-                                    ssrc: pkt_ssrc,
-                                    first_seq: seq,
-                                    last_seq: seq,
-                                    first_ts: ts,
-                                    packet_count: 1,
-                                    consecutive_count: 0,
-                                    has_marker: marker,
-                                });
-                            }
-
-                            if addr != current_remote {
-                                *self.remote_addr.write() = addr;
-                            }
-
-                            let total = prob.total_packets;
-                            let winner: Option<SocketAddr>;
-
-                            // Rule 1: candidate with marker=true and the
-                            // lowest first_seq wins immediately.
-                            let marker_winner = prob
-                                .candidates
-                                .iter()
-                                .filter(|c| c.has_marker)
-                                .min_by_key(|c| c.first_seq);
-
-                            if let Some(mw) = marker_winner {
-                                winner = Some(mw.addr);
-                            } else if total >= prob.max_packets {
-                                // Rule 3 (timeout fallback): pick the
-                                // candidate with the most packets; break
-                                // ties by lowest first_seq.
-                                winner = prob
-                                    .candidates
-                                    .iter()
-                                    .max_by(|a, b| {
-                                        a.packet_count
-                                            .cmp(&b.packet_count)
-                                            .then(b.first_seq.cmp(&a.first_seq))
-                                    })
-                                    .map(|c| c.addr);
-                            } else {
-                                // Rule 2: consecutive dominance — at
-                                // least 2 consecutive packets from one
-                                // source and at least 3 total observed.
-                                winner = if total >= 3 {
-                                    prob.candidates
-                                        .iter()
-                                        .find(|c| c.consecutive_count >= 2)
-                                        .map(|c| c.addr)
-                                } else {
-                                    None
-                                };
-                            }
-
-                            if let Some(win_addr) = winner {
-                                // Commit the latch.
-                                *probation_guard = None; // drop state
-                                drop(probation_guard);
-
-                                if win_addr != current_remote {
-                                    *self.remote_addr.write() = win_addr;
-                                }
-                                self.rtp_latched.store(true, Ordering::Relaxed);
-                                trace!(
-                                    "IceConn: RTP latched to {} after probation \
-                                         (expected_ssrc={}, total_obs={})",
-                                    win_addr, expected, total
-                                );
-                            }
+                        if self.rtp_latched.load(Ordering::Relaxed) {
+                            // Steady state: a different source may take over
+                            // the egress path only by proving persistence
+                            // (competitive re-latch).  Packets from the
+                            // incumbent keep the latch healthy instead.
+                            self.observe_relatch(addr, pkt_ssrc, seq);
                         } else {
-                            // No probation state — immediate latch
-                            // (legacy path for callers that never called
-                            // `enable_latch_on_rtp`).
-                            if addr != current_remote {
-                                *self.remote_addr.write() = addr;
-                            }
-                            self.rtp_latched.store(true, Ordering::Relaxed);
-                            trace!(
-                                "IceConn: RTP latched to {} immediately \
-                                     (expected_ssrc={})",
-                                addr, expected
-                            );
+                            self.latch_probation(addr, pkt_ssrc, seq, marker, expected);
                         }
                     }
                 }
@@ -768,13 +1070,19 @@ impl StatsProvider for IceConn {
         let tx_packets = self.tx_packets.load(Ordering::Relaxed);
         let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         let label = self.label.as_deref().unwrap_or("unknown");
+        let remote = *self.remote_addr.read();
         let id = StatsId::new(format!("ice-conn-{}", label));
         let entry = StatsEntry::new(id, StatsKind::Transport)
             .with_value("label", json!(label))
             .with_value("rxPackets", json!(rx_packets))
             .with_value("rxBytes", json!(rx_bytes))
             .with_value("txPackets", json!(tx_packets))
-            .with_value("txBytes", json!(tx_bytes));
+            .with_value("txBytes", json!(tx_bytes))
+            .with_value("srcAddr", json!(remote.to_string()))
+            .with_value(
+                "relatchCount",
+                json!(self.relatch_count.load(Ordering::Relaxed)),
+            );
         Ok(vec![entry])
     }
 }
@@ -1048,18 +1356,23 @@ mod tests {
         let mut marshal_buf = Vec::new();
         conn.receive(rtp_pkt, rtp_src, &mut marshal_buf).await;
 
+        let rtcp_pkt = Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]);
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
-        conn.receive(
-            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
-            rtcp_src,
-            &mut marshal_buf,
-        )
-        .await;
+        // One RTCP packet is not enough to move the RTCP destination…
+        conn.receive(rtcp_pkt.clone(), rtcp_src, &mut marshal_buf)
+            .await;
+        assert_eq!(
+            *conn.remote_rtcp_addr.read(),
+            Some(initial_rtcp_addr),
+            "a single RTCP packet must not re-latch the RTCP destination"
+        );
+        // …but repetition is the real sender's proof.
+        conn.receive(rtcp_pkt, rtcp_src, &mut marshal_buf).await;
 
         assert_eq!(
             *conn.remote_rtcp_addr.read(),
             Some(rtcp_src),
-            "RTCP should latch its own destination"
+            "RTCP should latch its own destination after repetition"
         );
         assert!(conn.rtcp_latched.load(Ordering::Relaxed));
     }
@@ -1080,13 +1393,11 @@ mod tests {
         let mut marshal_buf = Vec::new();
         conn.receive(rtp_pkt, rtp_src, &mut marshal_buf).await;
 
+        let rtcp_pkt = Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]);
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
-        conn.receive(
-            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
-            rtcp_src,
-            &mut marshal_buf,
-        )
-        .await;
+        conn.receive(rtcp_pkt.clone(), rtcp_src, &mut marshal_buf)
+            .await;
+        conn.receive(rtcp_pkt, rtcp_src, &mut marshal_buf).await;
         assert_eq!(*conn.remote_rtcp_addr.read(), Some(rtcp_src));
 
         let rogue_rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6001);
@@ -1250,11 +1561,22 @@ mod tests {
 
     // ── Probation-specific tests ───────────────────────────────────────────
 
+    /// Minimal 12-byte RTP packet helper for the latch tests.
+    fn rtp(seq: u16, ssrc: u32, marker: bool) -> Bytes {
+        let mut p = vec![0x80u8, if marker { 0x80 } else { 0x00 }];
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // timestamp
+        p.extend_from_slice(&ssrc.to_be_bytes());
+        Bytes::from(p)
+    }
+
     /// Reproduce the Wireshark scenario: port 4114 sends seq=21466 first,
     /// then port 4014 sends seq=21465 with marker=true.  The latch MUST
-    /// resolve to port 4014.
+    /// resolve to port 4014.  A marker packet no longer wins by itself —
+    /// the real source wins because its marker-carrying flow is also the
+    /// one showing consecutive sequence numbers.
     #[tokio::test]
-    async fn test_probation_marker_wins_over_first_arriving_packet() {
+    async fn test_probation_marker_source_wins_by_dominance() {
         let (_tx, rx) = watch::channel(None);
         let sdp_addr: SocketAddr = "223.104.80.120:4000".parse().unwrap();
         let port_4114: SocketAddr = "223.104.80.120:4114".parse().unwrap();
@@ -1267,33 +1589,37 @@ mod tests {
         conn.set_expected_ssrc(ssrc);
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
 
-        // Frame 508072: port 4114, seq=21466, marker=false  (arrives first)
-        let mut pkt_4114 = vec![0x80u8, 0x08, 0x53, 0xCA, 0x00, 0x00, 0x00, 0xA0];
-        pkt_4114.extend_from_slice(&ssrc.to_be_bytes());
         let mut marshal_buf = Vec::new();
-        conn.receive(Bytes::from(pkt_4114), port_4114, &mut marshal_buf)
+        // Frame 508072: port 4114, seq=21466, marker=false (arrives first)
+        conn.receive(rtp(21466, ssrc, false), port_4114, &mut marshal_buf)
             .await;
-
-        // Latch should NOT have fired yet (only 1 packet, no marker)
         assert!(
             !conn.rtp_latched.load(Ordering::Relaxed),
-            "Should not latch after just one packet with no marker"
+            "one packet from a stray source must not latch"
         );
 
-        // Frame 508078: port 4014, seq=21465 (lower!), marker=true  (real start)
-        let mut pkt_4014 = vec![0x80u8, 0x88, 0x53, 0xC9, 0x00, 0x00, 0x00, 0xA0];
-        pkt_4014.extend_from_slice(&ssrc.to_be_bytes());
-        conn.receive(Bytes::from(pkt_4014), port_4014, &mut marshal_buf)
+        // Frame 508078: port 4014, seq=21465 (lower!), marker=true (real
+        // start).  Still no latch — a lone marker packet must not move the
+        // egress address.
+        conn.receive(rtp(21465, ssrc, true), port_4014, &mut marshal_buf)
             .await;
-
         assert!(
-            conn.rtp_latched.load(Ordering::Relaxed),
-            "Should latch after marker packet"
+            !conn.rtp_latched.load(Ordering::Relaxed),
+            "a lone marker packet must not latch"
         );
+
+        // The real source continues its run: 3 packets in a row from port
+        // 4014 is consecutive dominance (run length 3 = consecutive_count
+        // 2, 4 observed) — port 4014 wins over the stray first packet.
+        conn.receive(rtp(21466, ssrc, false), port_4014, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(21467, ssrc, false), port_4014, &mut marshal_buf)
+            .await;
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
         assert_eq!(
             *conn.remote_addr.read(),
             port_4014,
-            "Should latch to port 4014 (marker=true), not port 4114 (first arrived)"
+            "the marker-carrying real source wins by consecutive dominance"
         );
     }
 
@@ -1381,8 +1707,9 @@ mod tests {
         );
     }
 
-    /// Once latched, subsequent packets from a different address must NOT
-    /// change the latched remote.  Latch is sticky until reset_latch().
+    /// Once latched, a few packets from a different address must NOT move
+    /// the latched remote — a takeover requires sustained flow (see the
+    /// competitive re-latch tests below).
     #[tokio::test]
     async fn test_probation_latch_is_sticky_after_commit() {
         let (_tx, rx) = watch::channel(None);
@@ -1395,31 +1722,30 @@ mod tests {
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
 
-        // Latch to good_src via marker
-        let pkt = Bytes::from(vec![
-            0x80, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        ]);
+        // Latch to good_src via consecutive dominance (3 packets).
         let mut marshal_buf = Vec::new();
-        conn.receive(pkt, good_src, &mut marshal_buf).await;
+        for seq in 1u16..=3 {
+            conn.receive(rtp(seq, 0x01, false), good_src, &mut marshal_buf)
+                .await;
+        }
         assert!(conn.rtp_latched.load(Ordering::Relaxed));
         assert_eq!(*conn.remote_addr.read(), good_src);
 
-        // Rogue source sends packets — addr must not change
-        for seq in 2u8..=5 {
-            let rogue_pkt = Bytes::from(vec![
-                0x80, 0x00, 0x00, seq, 0x00, 0x00, 0x00, seq, 0x00, 0x00, 0x00, 0x99,
-            ]);
-            conn.receive(rogue_pkt, rogue_src, &mut marshal_buf).await;
+        // A rogue source below the takeover threshold must not flip it.
+        for seq in 2u16..=4 {
+            conn.receive(rtp(seq, 0x99, false), rogue_src, &mut marshal_buf)
+                .await;
         }
         assert_eq!(
             *conn.remote_addr.read(),
             good_src,
-            "Latched address must not change after latch is committed"
+            "a few stray packets must not change the latched remote"
         );
+        assert_eq!(conn.relatch_count(), 0, "no re-latch committed");
     }
 
     /// reset_latch() clears the latch so a new source can be selected
-    /// (used on re-INVITE).
+    /// (used on re-INVITE).  Also clears the re-latch probe and cooldown.
     #[tokio::test]
     async fn test_reset_latch_allows_re_latching() {
         let (_tx, rx) = watch::channel(None);
@@ -1432,26 +1758,306 @@ mod tests {
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
 
-        let pkt = Bytes::from(vec![
-            0x80, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        ]);
         let mut marshal_buf = Vec::new();
-        conn.receive(pkt.clone(), first_src, &mut marshal_buf).await;
+        for seq in 1u16..=3 {
+            conn.receive(rtp(seq, 0x01, false), first_src, &mut marshal_buf)
+                .await;
+        }
         assert_eq!(*conn.remote_addr.read(), first_src);
 
         conn.reset_latch();
         assert!(!conn.rtp_latched.load(Ordering::Relaxed));
 
-        // After reset, the new source with marker should win
-        let pkt2 = Bytes::from(vec![
-            0x80, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
-        ]);
-        conn.receive(pkt2, second_src, &mut marshal_buf).await;
+        // After reset, the new source wins once it shows persistence too.
+        for seq in 1u16..=3 {
+            conn.receive(rtp(seq, 0x02, false), second_src, &mut marshal_buf)
+                .await;
+        }
         assert_eq!(
             *conn.remote_addr.read(),
             second_src,
             "Should re-latch to new source after reset_latch()"
         );
+    }
+
+    // ── Competitive re-latch tests ─────────────────────────────────────────
+
+    /// NAT rebinding: after the initial latch, the peer reappears from a
+    /// different ip:port with the same SSRC.  `RELATCH_PACKETS` consecutive
+    /// packets take over the egress path, and both the initial latch and the
+    /// re-latch surface as `SourceChange` events.
+    #[tokio::test]
+    async fn test_relatch_after_sustained_new_source() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let rebound: SocketAddr = "10.0.0.2:6000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp(); // max_packets = 0 → immediate latch
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let (change_tx, mut change_rx) = crate::platform::sync::mpsc::unbounded_channel();
+        conn.set_source_change_sender(change_tx);
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+        assert_eq!(*conn.remote_addr.read(), first);
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
+
+        // The peer reappears from a new source with the same SSRC.
+        for seq in 100..104u16 {
+            conn.receive(rtp(seq, ssrc, false), rebound, &mut marshal_buf)
+                .await;
+        }
+
+        assert_eq!(
+            *conn.remote_addr.read(),
+            rebound,
+            "sustained flow from the new source must take over the egress path"
+        );
+        assert!(
+            conn.rtp_latched.load(Ordering::Relaxed),
+            "latch stays committed across a re-latch"
+        );
+        assert_eq!(conn.relatch_count(), 1);
+
+        // Events: initial latch (switch 0), then the re-latch (switch 1).
+        let e0 = change_rx.recv().await.expect("initial latch event");
+        assert_eq!((e0.from, e0.to, e0.switch), (initial, first, 0));
+        let e1 = change_rx.recv().await.expect("re-latch event");
+        assert_eq!((e1.from, e1.to, e1.ssrc, e1.switch), (first, rebound, ssrc, 1));
+        assert!(
+            change_rx.try_recv().is_err(),
+            "no further source-change events expected"
+        );
+    }
+
+    /// Below the takeover threshold a new source must not flip the address.
+    #[tokio::test]
+    async fn test_relatch_requires_sustained_flow() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let contender: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+
+        // RELATCH_PACKETS - 1 packets: not enough.
+        for seq in 100..103u16 {
+            conn.receive(rtp(seq, ssrc, false), contender, &mut marshal_buf)
+                .await;
+        }
+
+        assert_eq!(*conn.remote_addr.read(), first);
+        assert_eq!(conn.relatch_count(), 0);
+    }
+
+    /// The probe identity is addr+SSRC: a contender whose SSRC drifts keeps
+    /// restarting its probe and never takes over.
+    #[tokio::test]
+    async fn test_relatch_ssrc_drift_restarts_probe() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let contender: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+
+        // Four packets, but the SSRC flips every packet — no consistent
+        // ip:port + SSRC identity, no credit.
+        conn.receive(rtp(100, 0x2222, false), contender, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(101, 0x3333, false), contender, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(102, 0x2222, false), contender, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(103, 0x3333, false), contender, &mut marshal_buf)
+            .await;
+
+        assert_eq!(*conn.remote_addr.read(), first);
+        assert_eq!(conn.relatch_count(), 0);
+    }
+
+    /// A packet from the incumbent proves the old path is alive and resets
+    /// any pending takeover probe.
+    #[tokio::test]
+    async fn test_relatch_incumbent_packet_resets_probe() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let rebound: SocketAddr = "10.0.0.2:6000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+
+        // Contender builds up 2 packets of credit…
+        conn.receive(rtp(100, ssrc, false), rebound, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(101, ssrc, false), rebound, &mut marshal_buf)
+            .await;
+        // …then the incumbent reasserts itself…
+        conn.receive(rtp(5, ssrc, false), first, &mut marshal_buf)
+            .await;
+        // …so the contender's next two packets only reach 2 consecutive
+        // again — far from the takeover threshold.
+        conn.receive(rtp(102, ssrc, false), rebound, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(103, ssrc, false), rebound, &mut marshal_buf)
+            .await;
+
+        assert_eq!(
+            *conn.remote_addr.read(),
+            first,
+            "incumbent liveness must reset the takeover probe"
+        );
+        assert_eq!(conn.relatch_count(), 0);
+    }
+
+    /// Immediately after a committed switch the cooldown suppresses further
+    /// probes (anti flapping between paths).
+    #[tokio::test]
+    async fn test_relatch_cooldown_blocks_flapping() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let a: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let c: SocketAddr = "10.0.0.3:5000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), a, &mut marshal_buf).await;
+
+        // A → B commits.
+        for seq in 100..104u16 {
+            conn.receive(rtp(seq, ssrc, false), b, &mut marshal_buf)
+                .await;
+        }
+        assert_eq!(*conn.remote_addr.read(), b);
+        assert_eq!(conn.relatch_count(), 1);
+
+        // C starts immediately — inside the cooldown window.
+        for seq in 200..204u16 {
+            conn.receive(rtp(seq, ssrc, false), c, &mut marshal_buf)
+                .await;
+        }
+        assert_eq!(
+            *conn.remote_addr.read(),
+            b,
+            "cooldown must suppress a third source right after a switch"
+        );
+        assert_eq!(conn.relatch_count(), 1);
+    }
+
+    /// After `RELATCH_MAX_SWITCHES` commits the egress address is frozen —
+    /// even a sustained contender is ignored until signaling retargets.
+    #[tokio::test]
+    async fn test_relatch_budget_exhausted() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let hops: Vec<SocketAddr> = vec![
+            "10.0.1.1:5000".parse().unwrap(),
+            "10.0.2.1:5000".parse().unwrap(),
+            "10.0.3.1:5000".parse().unwrap(),
+            "10.0.4.1:5000".parse().unwrap(),
+        ];
+        let frozen: SocketAddr = "10.0.5.1:5000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+
+        // Four hops, each past the cooldown of the previous one.
+        for (i, hop) in hops.iter().enumerate() {
+            conn.test_advance_clock_ms(RELATCH_COOLDOWN_MS + 1_000);
+            let base = 100u16.wrapping_add((i as u16) * 100);
+            for seq in base..base + 4 {
+                conn.receive(rtp(seq, ssrc, false), *hop, &mut marshal_buf)
+                    .await;
+            }
+        }
+        assert_eq!(*conn.remote_addr.read(), hops[3]);
+        assert_eq!(conn.relatch_count(), RELATCH_MAX_SWITCHES);
+
+        // A fifth contender proves persistence too — but the budget is gone.
+        conn.test_advance_clock_ms(RELATCH_COOLDOWN_MS + 1_000);
+        for seq in 900..904u16 {
+            conn.receive(rtp(seq, ssrc, false), frozen, &mut marshal_buf)
+                .await;
+        }
+        assert_eq!(
+            *conn.remote_addr.read(),
+            hops[3],
+            "egress must stay frozen once the re-latch budget is exhausted"
+        );
+        assert_eq!(conn.relatch_count(), RELATCH_MAX_SWITCHES);
+    }
+
+    /// A probe that trickles in slower than the window expires and restarts —
+    /// it must not accumulate credit across the gap.
+    #[tokio::test]
+    async fn test_relatch_probe_window_expiry() {
+        let (_tx, rx) = watch::channel(None);
+        let initial: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let first: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let contender: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let ssrc: u32 = 0x1234;
+
+        let conn = IceConn::new(rx, initial, None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut marshal_buf = Vec::new();
+        conn.receive(rtp(1, ssrc, false), first, &mut marshal_buf)
+            .await;
+
+        // Two packets now…
+        conn.receive(rtp(100, ssrc, false), contender, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(101, ssrc, false), contender, &mut marshal_buf)
+            .await;
+        // …then a gap longer than the probe window…
+        conn.test_advance_clock_ms(RELATCH_WINDOW_MS + 1);
+        // …and two more: the probe restarted, so credit never accumulates.
+        conn.receive(rtp(102, ssrc, false), contender, &mut marshal_buf)
+            .await;
+        conn.receive(rtp(103, ssrc, false), contender, &mut marshal_buf)
+            .await;
+
+        assert_eq!(*conn.remote_addr.read(), first);
+        assert_eq!(conn.relatch_count(), 0);
     }
 
     // ---------------------------------------------------------------------------

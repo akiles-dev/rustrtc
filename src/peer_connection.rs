@@ -34,7 +34,7 @@ use crate::t38::t30::{T30FaxConfig, T30Role, T30Session};
 use crate::transports::dtls;
 use crate::transports::dtls::DtlsTransport;
 use crate::transports::get_local_ip;
-use crate::transports::ice::conn::IceConn;
+use crate::transports::ice::conn::{IceConn, SourceChange};
 use crate::transports::ice::stun::random_u32;
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport};
 use crate::transports::rtp::{
@@ -339,6 +339,13 @@ pub trait RtpObserver: Send + Sync {
     /// push. Plaintext in both cases. Fires for every packet this transport
     /// emits on the wire.
     fn on_egress(&self, _packet: &RtpPacket, _dst_addr: core::net::SocketAddr) {}
+
+    /// The latched RTP remote source (the egress destination) changed: the
+    /// initial latch commit (`switch == 0`) or a competitive re-latch after
+    /// e.g. a NAT rebinding (`switch >= 1`).  Rare — at most a handful of
+    /// times per session.  Delivered asynchronously on the connection's
+    /// event forwarder; observers registered before the change observe it.
+    fn on_source_change(&self, _change: &SourceChange) {}
 }
 
 const RTP_RECEIVER_SAMPLE_CAPACITY: usize = 64;
@@ -791,6 +798,10 @@ struct PeerConnectionInner {
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     event_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     event_rx: sync::AsyncMutex<mpsc::UnboundedReceiver<PeerConnectionEvent>>,
+    /// Lazily-created sink for RTP source-change notifications from the
+    /// media `IceConn`s; a forwarder task delivers them to the registered
+    /// [`RtpObserver`]s.
+    source_change_tx: Mutex<Option<mpsc::UnboundedSender<SourceChange>>>,
     dtls_role: watch::Sender<Option<bool>>,
     _dtls_role_rx: watch::Receiver<Option<bool>>,
     stats_collector: Arc<StatsCollector>,
@@ -1022,6 +1033,7 @@ impl PeerConnection {
             data_channels: Arc::new(Mutex::new(Vec::new())),
             event_tx,
             event_rx: sync::AsyncMutex::new(event_rx),
+            source_change_tx: Mutex::new(None),
             dtls_role: dtls_role_tx,
             _dtls_role_rx: dtls_role_rx.clone(),
             stats_collector: Arc::new(StatsCollector::new()),
@@ -1102,6 +1114,40 @@ impl PeerConnection {
 
     pub fn config(&self) -> &RtcConfiguration {
         &self.inner.config
+    }
+
+    /// Returns the sink for RTP source-change notifications, creating the
+    /// channel and its forwarder task on first use.  The forwarder delivers
+    /// transport-level `SourceChange` values to the registered
+    /// [`RtpObserver`]s via [`RtpObserver::on_source_change`].
+    fn source_change_sender(&self) -> mpsc::UnboundedSender<SourceChange> {
+        let mut guard = self.inner.source_change_tx.lock();
+        if let Some(tx) = guard.as_ref() {
+            return tx.clone();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let inner_weak = Arc::downgrade(&self.inner);
+        let h = crate::spawn_rtc(
+            self.inner.config.runtime_handle.as_ref(),
+            self.inner.pc_span.clone(),
+            async move {
+                while let Some(change) = rx.recv().await {
+                    let Some(inner) = inner_weak.upgrade() else {
+                        // PeerConnection dropped — stop forwarding.
+                        break;
+                    };
+                    // Read the live observer list at delivery time so
+                    // observers registered after the transport was wired
+                    // still observe subsequent changes.
+                    for observer in inner.rtp_observers.lock().iter() {
+                        observer.on_source_change(&change);
+                    }
+                }
+            },
+        );
+        self.inner.track_task(h);
+        *guard = Some(tx.clone());
+        tx
     }
 
     pub fn bridge_rtp_with_rewrite_to(
@@ -2535,6 +2581,8 @@ impl PeerConnection {
                 debug!("start_dtls: enabling symmetric-RTP latch (direct mode)");
             });
             ice_conn.enable_latch_on_rtp();
+            // Surface latch commits / competitive re-latches to the app.
+            ice_conn.set_source_change_sender(self.source_change_sender());
         }
 
         // Monitor selected pair changes to update remote address
@@ -3426,6 +3474,8 @@ impl PeerConnection {
         );
         if self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
+            // Surface latch commits / competitive re-latches to the app.
+            ice_conn.set_source_change_sender(self.source_change_sender());
         }
         ice_conn.set_remote_rtcp_addr(
             section.and_then(|section| {
@@ -13086,6 +13136,52 @@ a=mid:0
             }
             PeerConnectionEvent::DataChannel(_) => panic!("Expected Track event, got DataChannel"),
         }
+    }
+
+    /// The source-change channel wired into the media `IceConn`s delivers
+    /// latch commits and competitive re-latches to registered
+    /// [`RtpObserver`]s.
+    #[tokio::test]
+    async fn source_change_delivered_to_rtp_observers() {
+        use std::sync::Mutex as StdMutex;
+
+        struct Recorder(Arc<StdMutex<Vec<SourceChange>>>);
+        impl RtpObserver for Recorder {
+            fn on_source_change(&self, change: &SourceChange) {
+                self.0.lock().unwrap().push(change.clone());
+            }
+        }
+
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        pc.add_observer(Arc::new(Recorder(seen.clone())));
+
+        let tx = pc.source_change_sender();
+        let from: core::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let to: core::net::SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        tx.send(SourceChange {
+            from,
+            to,
+            ssrc: 0x1234,
+            switch: 1,
+        })
+        .expect("send source change");
+
+        // The forwarder delivers asynchronously — poll briefly.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(2);
+        while seen.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source change was not delivered to the observer"
+            );
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        let changes = seen.lock().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            (changes[0].from, changes[0].to, changes[0].ssrc, changes[0].switch),
+            (from, to, 0x1234, 1)
+        );
     }
 
     #[tokio::test]

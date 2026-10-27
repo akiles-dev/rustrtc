@@ -263,7 +263,16 @@ let config = RtcConfigurationBuilder::new()
 
 ### RTP Latching
 - **`enable_latching`** — Enable dynamic remote address detection for RTP-only mode.
-- **`probation_max_packets`** — Number of packets to observe before committing a latched address.
+- **`probation_max_packets`** — Number of packets to observe before committing a latched address. A single packet (marker or not) never moves the egress address: candidates win by consecutive sequence numbers with a consistent SSRC, or by the observation-budget fallback.
+
+After the initial latch, the connection supports **competitive re-latch** for NAT rebinding (the peer switching networks without a re-INVITE): a new source takes over the egress path only after 4 consecutive-sequence packets carrying one SSRC within a 2 s window. Switches are rate-limited (10 s cooldown, max 4 per session, frozen afterwards until a new SDP retargets). Two RTCP packets are required to move a non-mux RTCP destination.
+
+Every latch commit and re-latch is observable:
+- **`RtpObserver::on_source_change(&SourceChange)`** — `from`/`to` addresses, driving SSRC, and the switch index (0 = initial latch). Register via `PeerConnection::add_observer`.
+- **Stats** — `srcAddr` (current egress target) and `relatchCount` on the `ice-conn` stats entry.
+- **Logs** — latch commits at `INFO`, suppressed probes (cooldown/budget exhausted) at `DEBUG`/`WARN`.
+
+Note: persistence-based latching is accident-robustness (stale NAT bindings, port reuse, stray packets), not a security boundary — keep SDP/confidential signaling as the outer defense.
 
 ### Media Capabilities
 - **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`.
