@@ -528,6 +528,15 @@ pub struct RtcConfiguration {
     /// This should be larger than `stun_timeout` to allow more retransmissions
     /// and reduce the probability of nomination failures under packet loss.
     pub nomination_timeout: core::time::Duration,
+    /// How long to keep collecting successful pairs after the first one
+    /// before nominating. A short grace favours fast setup but lets a
+    /// low-priority relay pair (checks complete in ~1 RTT to the TURN
+    /// server) beat a higher-priority direct pair that needs a cross-ISP
+    /// round trip (~300 ms in practice) — the session then stays on relay
+    /// even though a direct path validates moments later. Port-forwarding
+    /// and tunnel use cases should raise this (e.g. 500 ms) so relay
+    /// stays a true last resort.
+    pub nomination_grace: core::time::Duration,
     pub ice_connection_timeout: core::time::Duration,
     /// How long without receiving any packet (STUN/DTLS/SCTP) before the ICE
     /// transport is demoted from `Connected` to `Disconnected`.
@@ -692,6 +701,7 @@ impl PartialEq for RtcConfiguration {
             && self.stun_timeout == other.stun_timeout
             && self.ice_gather_timeout == other.ice_gather_timeout
             && self.nomination_timeout == other.nomination_timeout
+            && self.nomination_grace == other.nomination_grace
             && self.ice_connection_timeout == other.ice_connection_timeout
             && self.ice_disconnect_threshold == other.ice_disconnect_threshold
             && self.ice_disconnect_grace == other.ice_disconnect_grace
@@ -759,6 +769,7 @@ impl Default for RtcConfiguration {
             stun_timeout: core::time::Duration::from_secs(5),
             ice_gather_timeout: core::time::Duration::ZERO,
             nomination_timeout: core::time::Duration::from_secs(10),
+            nomination_grace: core::time::Duration::from_millis(200),
             ice_connection_timeout: core::time::Duration::from_secs(120),
             ice_disconnect_threshold: core::time::Duration::from_secs(30),
             ice_disconnect_grace: core::time::Duration::from_secs(60),
@@ -995,6 +1006,13 @@ impl RtcConfigurationBuilder {
 
     pub fn nomination_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.nomination_timeout = timeout;
+        self
+    }
+
+    /// Override the post-first-success nomination grace (see
+    /// [`RtcConfiguration::nomination_grace`]).
+    pub fn nomination_grace(mut self, grace: core::time::Duration) -> Self {
+        self.inner.nomination_grace = grace;
         self
     }
 

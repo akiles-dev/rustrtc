@@ -2484,14 +2484,17 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // a stale LAN host candidate returning EHOSTDOWN/EHOSTUNREACH) from stalling
     // connection setup for the full STUN timeout — all checks still run
     // concurrently, but nomination is no longer gated on the slowest failing pair.
-    const NOMINATION_GRACE: Duration = Duration::from_millis(200);
+    // The grace is configurable (`nomination_grace`): a longer window lets
+    // higher-priority direct pairs (cross-ISP RTT) validate before nomination
+    // instead of losing the race to the always-fast relay pair.
+    let nomination_grace = inner.config.nomination_grace;
     loop {
         let next = if successful_pairs.is_empty() {
             checks.next().await
         } else {
             // checks arm polled first each wake (matches the old `biased;`).
             let mut checks_fut = core::pin::pin!(checks.next());
-            let mut grace_fut = core::pin::pin!(crate::platform::task::sleep(NOMINATION_GRACE));
+            let mut grace_fut = core::pin::pin!(crate::platform::task::sleep(nomination_grace));
             match crate::platform::select::select2(&mut checks_fut, &mut grace_fut).await {
                 crate::platform::select::Either::A(res) => res,
                 crate::platform::select::Either::B(_) => break,
@@ -5521,7 +5524,7 @@ impl IceGatherer {
 
                 // Try to discover gateway
                 if let Err(e) = mapper.discover_with_timeout(timeout).await {
-                    trace!("UPnP discovery failed for {}: {}", local_addr, e);
+                    debug!("UPnP discovery failed for {}: {} (check the router's UPnP/IGD setting, or on macOS the app's Local Network permission)", local_addr, e);
                     return;
                 }
 

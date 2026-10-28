@@ -6186,3 +6186,22 @@ async fn test_round_retries_after_concurrent_nomination_failure() -> Result<()> 
     assert_eq!(selected.remote.address, pair.remote.address);
     Ok(())
 }
+
+/// `nomination_grace` must default to the historical 200 ms (no behaviour
+/// change for existing embedders) and be overridable via the builder —
+/// port-forwarding stacks raise it so the always-fast relay pair cannot
+/// beat a cross-ISP direct pair to nomination.
+#[test]
+fn test_nomination_grace_default_and_builder() {
+    let config = RtcConfiguration::default();
+    assert_eq!(
+        config.nomination_grace,
+        Duration::from_millis(200),
+        "default must keep the historical 200 ms grace"
+    );
+
+    let config = RtcConfigurationBuilder::new()
+        .nomination_grace(Duration::from_millis(500))
+        .build();
+    assert_eq!(config.nomination_grace, Duration::from_millis(500));
+}
