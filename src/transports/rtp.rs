@@ -183,9 +183,9 @@ struct StreamRewriteState {
 struct OutTimeline {
     /// Highest outgoing sequence number assigned on this outgoing SSRC.
     high_water_seq: Option<u16>,
-    /// Last outgoing RTP timestamp emitted on this outgoing SSRC. Guards the
-    /// shared destination timeline: timestamps must never go backwards and a
-    /// stream switch continues right after the previous stream's tail.
+    /// Highest outgoing timestamp in wrapping serial-number order. Late
+    /// packets retain their sampling time without moving the tail used to
+    /// anchor the next source stream backwards.
     last_output_timestamp: Option<u32>,
     /// Source SSRC of the most recent packet on this outgoing SSRC.
     last_src_ssrc: Option<u32>,
@@ -351,7 +351,6 @@ impl RewriteBridge {
         // timeline may pin to the destination leg's prior local playback
         // (paced sender).
         let is_timeline_switch = matches!(timeline.last_src_ssrc, Some(src) if src != src_ssrc);
-        let mut switched_stream = false;
         if timeline.last_output_timestamp.is_none() {
             if let Some(desired_out) = self.options.initial_output_timestamp {
                 state.timestamp_offset = desired_out.wrapping_sub(src_timestamp);
@@ -365,26 +364,19 @@ impl RewriteBridge {
                 // Tell the receiver this continues a prior stream on the same
                 // SSRC after a source switch (ring→relay, IVR/CNG → relay).
                 packet.header.marker = true;
-                switched_stream = true;
             }
         }
         timeline.last_src_ssrc = Some(src_ssrc);
 
-        let mut out_timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
-        // Safety net: never emit a timestamp behind what the destination has
-        // already received on this SSRC (covers resumed streams whose
-        // per-source offset lags a stream that interleaved meanwhile).
-        if !switched_stream
-            && let Some(last_out) = timeline.last_output_timestamp
-            && out_timestamp.wrapping_sub(last_out) >= 0x8000_0000
-        {
-            state.timestamp_offset = last_out
-                .wrapping_add(REWRITE_STREAM_STEP)
-                .wrapping_sub(src_timestamp);
-            out_timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
-            packet.header.marker = true;
+        let out_timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
+        // RTP timestamps describe sampling time, so a reordered packet keeps
+        // its source-relative timestamp. Only advance the source-switch tail;
+        // changing the offset here would amplify every subsequent source gap.
+        if timeline.last_output_timestamp.is_none_or(|last_out| {
+            out_timestamp.wrapping_sub(last_out) < 0x8000_0000
+        }) {
+            timeline.last_output_timestamp = Some(out_timestamp);
         }
-        timeline.last_output_timestamp = Some(out_timestamp);
         packet.header.timestamp = out_timestamp;
 
         if !self.options.strip_extensions {
@@ -2137,6 +2129,139 @@ mod tests {
                 w[1].1.wrapping_sub(w[0].1) < 0x8000_0000,
                 "outgoing timestamps must not go backwards"
             );
+        }
+    }
+
+    /// A bounded old queue interleaved with current packets must not repeatedly
+    /// add the same source-clock gap to every following packet's timestamp.
+    #[tokio::test]
+    async fn test_rewrite_bridge_reordered_same_source_does_not_amplify_clock_span() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        for (name, source_packets) in [
+            ("ordered", vec![(0, 0), (1, 160), (2, 320), (3, 480)]),
+            (
+                "wrap",
+                vec![
+                    (65534, u32::MAX - 319),
+                    (65535, u32::MAX - 159),
+                    (0, 0),
+                    (1, 160),
+                ],
+            ),
+            (
+                "backlog-current",
+                vec![
+                    (0, 0),
+                    (95, 15200),
+                    (1, 160),
+                    (96, 15360),
+                    (2, 320),
+                    (97, 15520),
+                    (3, 480),
+                ],
+            ),
+        ] {
+            let output_seed = if name == "wrap" {
+                u32::MAX - 319
+            } else {
+                50000
+            };
+            let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (_src_tx, src_rx) =
+                watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+            let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+            let src_transport = RtpTransport::new(src_conn, false);
+
+            let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (_dst_tx, dst_rx) =
+                watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+            let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+            let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+            src_transport.bridge_rewrite_rules_to(
+                dst_transport,
+                RtpRewriteBridgeOptions {
+                    initial_sequence_number: Some(47295),
+                    initial_output_timestamp: Some(output_seed),
+                    ..Default::default()
+                },
+                vec![RtpRewriteRule {
+                    match_payload_type: None,
+                    fixed_out_ssrc: Some(10000),
+                    ssrc_offset: 0,
+                    out_payload_type: Some(0),
+                    sdes_mid_extension_id: None,
+                    sdes_mid: None,
+                }],
+            );
+            let mut guard = src_transport.rewrite_bridge.lock();
+            let bridge = guard.as_mut().unwrap();
+            let mut emitted = Vec::new();
+            for &(seq, timestamp) in &source_packets {
+                let header = crate::rtp::RtpHeader::new(8, seq, timestamp, 0x1234);
+                let payload = vec![seq as u8; 160];
+                let mut packet = RtpPacket::new(header, payload.clone());
+                bridge.rewrite_packet(&mut packet);
+                assert_eq!(packet.header.ssrc, 10000);
+                assert_eq!(packet.header.payload_type, 0);
+                assert_eq!(packet.payload.as_ref(), payload.as_slice());
+                emitted.push((packet.header.sequence_number, packet.header.timestamp));
+            }
+            eprintln!("{name}: source={source_packets:?} output={emitted:?}");
+            assert!(
+                emitted
+                    .windows(2)
+                    .all(|pair| pair[1].0.wrapping_sub(pair[0].0) == 1)
+            );
+            let expected_offset = output_seed.wrapping_sub(source_packets[0].1);
+            for (&(_, source_ts), &(_, output_ts)) in source_packets.iter().zip(&emitted) {
+                assert_eq!(
+                    output_ts,
+                    source_ts.wrapping_add(expected_offset),
+                    "{name}: reordered packets must preserve the source clock mapping"
+                );
+            }
+            if name == "backlog-current" {
+                assert_eq!(emitted[3].1.wrapping_sub(emitted[1].1), 160);
+                assert_eq!(emitted[5].1.wrapping_sub(emitted[3].1), 160);
+                // The final input is late. A genuinely different source must
+                // anchor after the current high-water timestamp, not its tail.
+                let high_water = emitted[5].1;
+                let mut packet = RtpPacket::new(
+                    crate::rtp::RtpHeader::new(8, 800, 9000000, 0x5678),
+                    vec![0x55; 160],
+                );
+                bridge.rewrite_packet(&mut packet);
+                assert_eq!(packet.header.timestamp, high_water.wrapping_add(160));
+                assert_eq!(
+                    packet.header.sequence_number,
+                    emitted.last().unwrap().0.wrapping_add(1)
+                );
+                assert_eq!(packet.header.ssrc, 10000);
+                assert_eq!(packet.header.payload_type, 0);
+                assert_eq!(packet.payload.as_ref(), &[0x55; 160]);
+
+                let mut resumed = RtpPacket::new(
+                    crate::rtp::RtpHeader::new(8, 98, 15680, 0x1234),
+                    vec![0x66; 160],
+                );
+                bridge.rewrite_packet(&mut resumed);
+                assert_eq!(resumed.header.timestamp, high_water.wrapping_add(320));
+                assert_eq!(
+                    resumed.header.sequence_number,
+                    packet.header.sequence_number.wrapping_add(1)
+                );
+                assert_eq!(resumed.payload.as_ref(), &[0x66; 160]);
+            } else {
+                assert!(
+                    emitted
+                        .windows(2)
+                        .all(|pair| pair[1].1.wrapping_sub(pair[0].1) == 160)
+                );
+            }
         }
     }
 
