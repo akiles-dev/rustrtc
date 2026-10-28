@@ -78,14 +78,24 @@ async fn ping_pong(
     }
 }
 
-async fn setup_echo_pair() -> Result<(
+async fn setup_echo_pair(
+    prefix: &str,
+) -> Result<(
     PeerConnection,
     PeerConnection,
     std::sync::Arc<rustrtc::transports::sctp::DataChannel>,
     std::sync::Arc<rustrtc::transports::sctp::DataChannel>,
 )> {
-    let pc_a = PeerConnection::new(RtcConfiguration::default());
-    let pc_b = PeerConnection::new(RtcConfiguration::default());
+    let pc_a = PeerConnection::new({
+        let mut c = RtcConfiguration::default();
+        c.label = Some(format!("{prefix}-A-offerer").into());
+        c
+    });
+    let pc_b = PeerConnection::new({
+        let mut c = RtcConfiguration::default();
+        c.label = Some(format!("{prefix}-B-answerer").into());
+        c
+    });
 
     let dc_a = pc_a.create_data_channel(
         "hold",
@@ -171,7 +181,7 @@ fn spawn_checking_flap_monitor(pc: &PeerConnection) -> tokio::task::JoinHandle<b
 async fn hold_renegotiation_keeps_ice_connected() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (pc_a, pc_b, dc_a, _dc_b) = setup_echo_pair().await?;
+    let (pc_a, pc_b, dc_a, _dc_b) = setup_echo_pair("t1").await?;
 
     // Sanity: path works before the hold.
     ping_pong(&pc_a, &dc_a, b"before-hold").await?;
@@ -228,7 +238,7 @@ async fn hold_renegotiation_keeps_ice_connected() -> Result<()> {
 async fn hold_renegotiation_from_answerer_side_keeps_ice_connected() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (pc_a, pc_b, dc_a, _dc_b) = setup_echo_pair().await?;
+    let (pc_a, pc_b, dc_a, _dc_b) = setup_echo_pair("t2").await?;
     ping_pong(&pc_a, &dc_a, b"before-hold").await?;
 
     let monitor_a = spawn_checking_flap_monitor(&pc_a);

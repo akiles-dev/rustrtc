@@ -1928,15 +1928,16 @@ impl PeerConnection {
             }
         }
 
-        if previous_remote.is_some() && !media_parameters_changed {
-            *self.inner.remote_description.lock() = Some(desc);
-            debug!(
-                "Remote SDP media parameters unchanged; updated signaling state without reconfiguring transports"
-            );
-            return Ok(());
-        }
-
-        {
+        // Decide the DTLS role from this description, but do NOT publish it
+        // yet: publishing wakes `handle_connected_state`, whose `start_dtls`
+        // reads `self.inner.remote_description` to decide whether an SCTP
+        // transport is needed. Storing the description happens at the very end
+        // of this function, so an early publish raced it: on fast (loopback)
+        // connects under load, start_dtls observed `remote_description == None`
+        // and permanently skipped SCTP setup — the PC still reached Connected,
+        // and every subsequent data-channel send failed with
+        // "SCTP not connected". Publish after the store instead.
+        let pending_dtls_role = {
             let current_role = *self.inner.dtls_role.borrow();
             if current_role.is_none() {
                 let mut new_role = None;
@@ -1965,10 +1966,24 @@ impl PeerConnection {
                         }
                     }
                 }
-                if let Some(r) = new_role {
-                    let _ = self.inner.dtls_role.send(Some(r));
-                }
+                new_role
+            } else {
+                None
             }
+        };
+
+        if previous_remote.is_some() && !media_parameters_changed {
+            *self.inner.remote_description.lock() = Some(desc);
+            debug!(
+                "Remote SDP media parameters unchanged; updated signaling state without reconfiguring transports"
+            );
+            // Publish after the store (see the note above); unreachable in
+            // practice (the first call always takes the slow path and sets the
+            // role), but keep the invariant airtight.
+            if let Some(r) = pending_dtls_role {
+                let _ = self.inner.dtls_role.send(Some(r));
+            }
+            return Ok(());
         }
 
         {
@@ -2427,6 +2442,12 @@ impl PeerConnection {
         {
             let mut remote = self.inner.remote_description.lock();
             *remote = Some(desc.clone());
+        }
+
+        // Remote description is visible now — safe to wake start_dtls (see the
+        // note above where the role is decided).
+        if let Some(r) = pending_dtls_role {
+            let _ = self.inner.dtls_role.send(Some(r));
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
