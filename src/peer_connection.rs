@@ -4575,8 +4575,17 @@ fn update_local_description_on_gather(
         if let Some(candidate) = candidates.first() {
             let mut local_guard = inner.local_description.lock();
             if let Some(desc) = local_guard.as_mut() {
-                // A rejected (port 0) section stays rejected.
-                for media in desc.media_sections.iter_mut().filter(|m| m.port != 0) {
+                // A rejected (port 0) section stays rejected. Sections that
+                // already carry a real port must not be rewritten either:
+                // Rtp/Srtp build_description binds one socket per non-BUNDLE
+                // m-line (direct transports for media_index > 0), so each
+                // section's port is its own transport's. Flattening them all
+                // onto the primary transport's candidate port corrupts the
+                // offer for strict legacy SIP peers (audio and video sharing
+                // one port → 488 / media blackhole). Only fill sections left
+                // at the unset placeholder (9) because gathering had nothing
+                // when the description was built.
+                for media in desc.media_sections.iter_mut().filter(|m| m.port == 9) {
                     media.port = candidate.address.port();
                     let ip_str = candidate.address.ip().to_string();
                     let ip_ver = if candidate.address.is_ipv4() {
@@ -13179,7 +13188,12 @@ a=mid:0
         let changes = seen.lock().unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(
-            (changes[0].from, changes[0].to, changes[0].ssrc, changes[0].switch),
+            (
+                changes[0].from,
+                changes[0].to,
+                changes[0].ssrc,
+                changes[0].switch
+            ),
             (from, to, 0x1234, 1)
         );
     }
