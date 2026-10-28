@@ -7330,6 +7330,7 @@ pub struct RtpSender {
     packets_sent: Arc<AtomicU32>,
     octets_sent: Arc<AtomicU32>,
     last_rtp_timestamp: Arc<AtomicU32>,
+    sampling_timestamp_high_water: Arc<Mutex<Option<u32>>>,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
@@ -7492,6 +7493,7 @@ impl RtpSender {
             packets_sent: Arc::new(AtomicU32::new(0)),
             octets_sent: Arc::new(AtomicU32::new(0)),
             last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
+            sampling_timestamp_high_water: Arc::new(Mutex::new(None)),
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
             transport_cc_ext_id: Arc::new(Mutex::new(None)),
@@ -7566,6 +7568,21 @@ impl RtpSender {
         self.last_rtp_timestamp.load(Ordering::Relaxed)
     }
 
+    /// Newest observed egress sampling timestamp in wrapping serial-number
+    /// order, or `None` before the first observation. External writers use
+    /// their existing observation boundary; paced sends update after success.
+    /// Comparisons assume forward advances smaller than half the RTP cycle.
+    pub fn rtp_timestamp_high_water(&self) -> Option<u32> {
+        *self.sampling_timestamp_high_water.lock()
+    }
+
+    fn advance_sampling_timestamp(high_water: &Mutex<Option<u32>>, timestamp: u32) {
+        let mut high_water = high_water.lock();
+        if high_water.is_none_or(|previous| timestamp.wrapping_sub(previous) < 0x8000_0000) {
+            *high_water = Some(timestamp);
+        }
+    }
+
     /// Packets counted for RTCP SR (paced send + [`Self::note_external_packet`]).
     pub fn packets_sent(&self) -> u32 {
         self.packets_sent.load(Ordering::Relaxed)
@@ -7579,6 +7596,7 @@ impl RtpSender {
         self.next_sequence_number
             .store(sequence_number.wrapping_add(1), Ordering::SeqCst);
         self.last_rtp_timestamp.store(timestamp, Ordering::Relaxed);
+        Self::advance_sampling_timestamp(&self.sampling_timestamp_high_water, timestamp);
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.octets_sent.fetch_add(payload_len, Ordering::Relaxed);
     }
@@ -7712,6 +7730,7 @@ impl RtpSender {
         let packets_sent = self.packets_sent.clone();
         let octets_sent = self.octets_sent.clone();
         let last_rtp_timestamp = self.last_rtp_timestamp.clone();
+        let sampling_timestamp_high_water = self.sampling_timestamp_high_water.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
         let transport_cc_ext_id = self.transport_cc_ext_id.clone();
@@ -7955,6 +7974,10 @@ impl RtpSender {
                                     }
                                     octets_sent.fetch_add(payload_len, Ordering::Relaxed);
                                     last_rtp_timestamp.store(packet_timestamp, Ordering::Relaxed);
+                                    Self::advance_sampling_timestamp(
+                                        &sampling_timestamp_high_water,
+                                        packet_timestamp,
+                                    );
                                 }
                             }
                             Err(crate::media::error::MediaError::Lagged) => {
@@ -11109,6 +11132,40 @@ a=sendrecv\r\n";
             1,
             "retransmission after resume"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sender_sampling_high_water_preserves_wire_last_and_counters() {
+        let (_, track, _) = sample_track(crate::media::MediaKind::Audio, 8);
+        let sender = RtpSender::new(
+            track,
+            10000,
+            "clock-boundary".into(),
+            RtpCodecParameters {
+                payload_type: 0,
+                name: "PCMU".into(),
+                clock_rate: 8000,
+                channels: 1,
+            },
+            Vec::new(),
+        );
+        assert_eq!(sender.rtp_timestamp_high_water(), None);
+        let timestamps = [u32::MAX - 159, 0, u32::MAX - 319, 160];
+        let expected_high_water = [u32::MAX - 159, 0, 0, 160];
+        for (index, (&timestamp, &expected)) in
+            timestamps.iter().zip(&expected_high_water).enumerate()
+        {
+            let sequence = 65534u16.wrapping_add(index as u16);
+            sender.note_external_packet(sequence, timestamp, 160);
+            assert_eq!(sender.last_rtp_timestamp(), timestamp);
+            assert_eq!(sender.rtp_timestamp_high_water(), Some(expected));
+            assert_eq!(sender.next_sequence_number(), sequence.wrapping_add(1));
+            assert_eq!(sender.packets_sent(), index as u32 + 1);
+            assert_eq!(
+                sender.octets_sent.load(Ordering::Relaxed),
+                (index as u32 + 1) * 160
+            );
+        }
     }
 
     #[tokio::test]
