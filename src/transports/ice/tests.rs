@@ -5919,3 +5919,270 @@ async fn select_pair_refuses_unresolvable_local() -> Result<()> {
     assert_eq!(selected.remote.address, remote_addr);
     Ok(())
 }
+
+// ===========================================================================
+// Controlling-side nomination round isolation (RFC 8445 §8.1.1)
+//
+// Regression coverage for the incident where two concurrent check rounds
+// both passed the `already nominated` guard (both read `None` on
+// `nomination_complete`); the losing round's USE-CANDIDATE was ignored by
+// the controlled peer (first nomination wins), its binding check timed out
+// (~10 s), and the `!nominated` fallback tore down a live, already-nominated
+// session. Remote tunnels died seconds after every successful setup.
+// ===========================================================================
+
+/// Build a controlling-side transport with loopback gathering so a gathered
+/// local socket exists and `commit_selected_pair` can resolve it.
+async fn nomination_test_fixture() -> IceTransport {
+    let mut config = RtcConfiguration::default();
+    config.ice_include_loopback_candidates = true;
+    let (transport, runner) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner);
+    transport.start_gathering().expect("start_gathering");
+
+    // Wait for a loopback candidate so its socket is resolvable.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if transport
+            .local_candidates()
+            .iter()
+            .any(|c| c.address.ip().is_loopback())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no loopback candidate gathered within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    transport
+}
+
+fn blackhole_pair(local: IceCandidate) -> IceCandidatePair {
+    // Remote port 1: nothing listens there; the socket only needs to RESOLVE,
+    // no packets are exchanged in these unit tests.
+    IceCandidatePair::new(local, IceCandidate::host("127.0.0.1:1".parse().unwrap(), 1))
+}
+
+/// A late round that lost the nomination race must drop without touching
+/// session state: no pair commit, no `Some(false)`, no `Failed`.
+#[tokio::test]
+#[serial]
+async fn test_late_round_drops_when_concurrent_round_already_nominated() -> Result<()> {
+    let transport = nomination_test_fixture().await;
+    let local = transport
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.address.ip().is_loopback())
+        .expect("loopback candidate");
+
+    transport.force_state_for_test(IceTransportState::Connected);
+    // The concurrent round already won the race: nomination is done.
+    transport.inner.nomination_complete.send(Some(true));
+
+    let round_generation = transport
+        .inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+
+    let pair = blackhole_pair(local);
+    let concluded = complete_controlling_nomination(
+        &transport.inner,
+        round_generation,
+        None, // this round's USE-CANDIDATE went unanswered
+        std::slice::from_ref(&pair),
+    );
+
+    assert!(!concluded, "the late round must drop without touching state");
+    assert_eq!(
+        *transport.inner.nomination_complete.borrow(),
+        Some(true),
+        "nomination state must be untouched"
+    );
+    assert_eq!(
+        *transport.inner.state.borrow(),
+        IceTransportState::Connected,
+        "the transport must not transition to Failed"
+    );
+    assert!(
+        transport.inner.selected_pair.lock().is_none(),
+        "the late round must not commit its own pair"
+    );
+    Ok(())
+}
+
+/// A first round with a working nomination still commits and signals
+/// `Some(true)` — the fix must not break the happy path.
+#[tokio::test]
+#[serial]
+async fn test_first_round_nomination_commits_and_signals() -> Result<()> {
+    let transport = nomination_test_fixture().await;
+    let local = transport
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.address.ip().is_loopback())
+        .expect("loopback candidate");
+
+    transport.force_state_for_test(IceTransportState::Connected);
+
+    let round_generation = transport
+        .inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+    let pair = blackhole_pair(local.clone());
+    let concluded = complete_controlling_nomination(
+        &transport.inner,
+        round_generation,
+        Some(pair.clone()),
+        std::slice::from_ref(&pair),
+    );
+
+    assert!(concluded, "the first round must commit");
+    assert_eq!(
+        *transport.inner.nomination_complete.borrow(),
+        Some(true),
+        "nomination must signal Some(true)"
+    );
+    let selected = transport
+        .inner
+        .selected_pair
+        .lock()
+        .clone()
+        .expect("selected pair must be committed");
+    assert_eq!(selected.local.address, local.address);
+    assert_eq!(selected.remote.address, pair.remote.address);
+    Ok(())
+}
+
+/// A round superseded by an ICE restart (generation bump) must drop silently:
+/// say nothing on `nomination_complete`, touch no state (the fresh post-
+/// restart round owns the state machine).
+#[tokio::test]
+#[serial]
+async fn test_round_superseded_by_restart_drops_silently() -> Result<()> {
+    let transport = nomination_test_fixture().await;
+    let local = transport
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.address.ip().is_loopback())
+        .expect("loopback candidate");
+
+    transport.force_state_for_test(IceTransportState::Connected);
+
+    let stale_generation = transport
+        .inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+    // ICE restart happened while this round was in flight.
+    transport
+        .inner
+        .nomination_generation
+        .store(stale_generation + 1, core::sync::atomic::Ordering::SeqCst);
+
+    let pair = blackhole_pair(local);
+    let concluded = complete_controlling_nomination(
+        &transport.inner,
+        stale_generation,
+        Some(pair.clone()),
+        std::slice::from_ref(&pair),
+    );
+
+    assert!(!concluded, "the superseded round must drop");
+    assert_eq!(
+        *transport.inner.nomination_complete.borrow(),
+        None,
+        "a superseded round says nothing on nomination_complete"
+    );
+    Ok(())
+}
+
+/// A first round that cannot commit any pair (no resolvable socket) must
+/// still fail the transport explicitly — the pre-fix behaviour for genuine
+/// blackhole setups is preserved.
+#[tokio::test]
+#[serial]
+async fn test_uncommittable_first_round_fails_transport() -> Result<()> {
+    let transport = nomination_test_fixture().await;
+
+    transport.force_state_for_test(IceTransportState::Connected);
+
+    let round_generation = transport
+        .inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+    // Local address was never gathered → no socket resolves → commit fails.
+    let pair = IceCandidatePair::new(
+        IceCandidate::host("10.255.255.1:9".parse().unwrap(), 1),
+        IceCandidate::host("127.0.0.1:1".parse().unwrap(), 1),
+    );
+    let concluded = complete_controlling_nomination(
+        &transport.inner,
+        round_generation,
+        None,
+        std::slice::from_ref(&pair),
+    );
+
+    assert!(concluded, "an uncommittable round concludes with Failed");
+    assert_eq!(
+        *transport.inner.nomination_complete.borrow(),
+        Some(false),
+        "nomination must signal Some(false)"
+    );
+    assert_eq!(
+        *transport.inner.state.borrow(),
+        IceTransportState::Failed,
+        "the transport must transition to Failed"
+    );
+    Ok(())
+}
+
+/// A round following a *failed* concurrent nomination (`Some(false)`) must be
+/// allowed to nominate: the failed round's fallback pair never received
+/// USE-CANDIDATE confirmation, so a fresh round is the session's chance to
+/// converge. Only a *successful* nomination (`Some(true)`) blocks follow-up
+/// rounds — this is the redundancy-heals-under-loss property.
+#[tokio::test]
+#[serial]
+async fn test_round_retries_after_concurrent_nomination_failure() -> Result<()> {
+    let transport = nomination_test_fixture().await;
+    let local = transport
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.address.ip().is_loopback())
+        .expect("loopback candidate");
+
+    transport.force_state_for_test(IceTransportState::Connected);
+    // Previous round committed a fallback pair but its USE-CANDIDATE went
+    // unanswered: nomination failed.
+    transport.inner.nomination_complete.send(Some(false));
+
+    let round_generation = transport
+        .inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+    let pair = blackhole_pair(local.clone());
+    let concluded = complete_controlling_nomination(
+        &transport.inner,
+        round_generation,
+        Some(pair.clone()),
+        std::slice::from_ref(&pair),
+    );
+
+    assert!(concluded, "the retry round must nominate and commit");
+    assert_eq!(
+        *transport.inner.nomination_complete.borrow(),
+        Some(true),
+        "retry round's successful nomination must signal Some(true)"
+    );
+    let selected = transport
+        .inner
+        .selected_pair
+        .lock()
+        .clone()
+        .expect("retry round must commit its pair");
+    assert_eq!(selected.remote.address, pair.remote.address);
+    Ok(())
+}

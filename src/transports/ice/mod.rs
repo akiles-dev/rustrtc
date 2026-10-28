@@ -352,6 +352,16 @@ pub(crate) struct IceTransportInner {
     /// Serializes every commit of `selected_pair` together with the socket
     /// published on `selected_socket` (see [`commit_selected_pair`]).
     selection_lock: crate::platform::sync::Mutex<()>,
+    /// Serializes the controlling-side nomination phase across concurrent
+    /// connectivity-check rounds. A late trickle candidate (or a peer-
+    /// reflexive discovery) spawns a fresh round while an earlier round may
+    /// still be mid-nomination; without this lock both rounds pass the
+    /// `already nominated` guard — both read `None` on `nomination_complete`
+    /// — and race to commit. The losing round's USE-CANDIDATE is ignored by
+    /// the controlled peer (first nomination wins, RFC 8445 §8.1.2), its
+    /// binding check times out, and the `!nominated` fallback then tore down
+    /// a live, already-nominated session.
+    nomination_lock: Mutex<()>,
     /// mDNS hostname advertising our host candidates (`enable_mdns`).
     mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
@@ -1427,6 +1437,7 @@ impl IceTransport {
             restart_requested: core::sync::atomic::AtomicBool::new(false),
             nomination_generation: crate::platform::atomic64::AtomicU64::new(0),
             selection_lock: crate::platform::sync::Mutex::new(()),
+            nomination_lock: Mutex::new(()),
             mdns_hostname: {
                 #[cfg(feature = "std")]
                 {
@@ -2535,12 +2546,23 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // Signal Connected so the PeerConnection starts waiting for nomination_complete.
         let _ = inner.set_state(IceTransportState::Connected);
 
+        // Serialize the nomination phase across concurrent check rounds (see
+        // `nomination_lock`). A late trickle candidate spawns a fresh round
+        // while this round may still be mid-nomination; both would pass the
+        // `already nominated` guard below (both read `None`), race to commit,
+        // and the loser — whose USE-CANDIDATE the controlled peer ignores —
+        // would tear down the freshly nominated session.
+        let _nomination_guard = inner.nomination_lock.lock().await;
+
         // Nominate once. Late trickle candidates re-trigger connectivity checks;
         // re-nominating on every round would make the controlled peer flap
         // between pairs (RFC 8445 nominates a single pair for the session —
         // re-nomination is only expected after an ICE restart, which resets
-        // nomination state).
-        if inner.nomination_complete.borrow().is_some() {
+        // nomination state). Only a *successful* nomination blocks follow-up
+        // rounds: if the previous round's USE-CANDIDATE went unanswered
+        // (`Some(false)`, e.g. heavy loss), a fresh round may still retry —
+        // losing rounds must be able to heal the session, not abandon it.
+        if *inner.nomination_complete.borrow() == Some(true) {
             debug!(
                 label = inner.config.label.as_deref().unwrap_or("-"),
                 "ICE checks complete (controlling): already nominated, keeping selected pair"
@@ -2567,6 +2589,20 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         let nomination_start = crate::platform::time::Instant::now();
         let mut nominated_pair: Option<IceCandidatePair> = None;
         for (idx, pair) in successful_pairs.iter().enumerate() {
+            // Bail out early if an ICE restart superseded this round: holding
+            // the nomination lock through a doomed nomination would delay the
+            // fresh post-restart round by up to nomination_timeout.
+            if inner
+                .nomination_generation
+                .load(core::sync::atomic::Ordering::SeqCst)
+                != round_generation
+            {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "ICE nomination aborted: round superseded by a restart"
+                );
+                break;
+            }
             // Always attempt the best pair; only bound the fallbacks.
             if idx > 0
                 && crate::platform::time::Instant::now().duration_since(nomination_start)
@@ -2602,52 +2638,16 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             }
         }
 
-        // Fall back to the highest-priority pair on all-fail so best-effort
-        // data still has a path.
-        let final_pair = nominated_pair
-            .clone()
-            .unwrap_or_else(|| successful_pairs[0].clone());
-        let nominated = nominated_pair.is_some();
-        let committed = {
-            let _selection = inner.selection_lock.lock();
-            if inner
-                .nomination_generation
-                .load(core::sync::atomic::Ordering::SeqCst)
-                != round_generation
-            {
-                debug!(
-                    label = inner.config.label.as_deref().unwrap_or("-"),
-                    "ICE checks complete (controlling): round superseded by a restart; dropping"
-                );
-                // Say nothing on `nomination_complete`: the restart reset it
-                // and the fresh round owns the state machine from here.
-                return;
-            }
-            commit_selected_pair(&inner, &final_pair, None)
-        };
-        debug!(
-            label = inner.config.label.as_deref().unwrap_or("-"),
-            "ICE checks complete. Selected pair: {} -> {}",
-            final_pair.local.address,
-            final_pair.remote.address
+        // Commit and signal this round's outcome. `complete_controlling_nomination`
+        // re-checks nomination state under the selection lock (RFC 8445 §8.1.1:
+        // a concurrent round's nomination, if it won the race, is authoritative
+        // and this round must neither stomp it nor fail the transport).
+        complete_controlling_nomination(
+            &inner,
+            round_generation,
+            nominated_pair,
+            &successful_pairs,
         );
-
-        if !committed {
-            // No socket serves the nominated pair (e.g. its socket was torn
-            // down between the check and this commit). Fail explicitly: a
-            // selected pair without a socket is a guaranteed blackhole, and
-            // keeping the previous half-updated selection silently is worse.
-            let _ = inner.nomination_complete.send(Some(false));
-            let _ = inner.set_state(IceTransportState::Failed);
-            return;
-        }
-
-        if nominated {
-            let _ = inner.nomination_complete.send(Some(true));
-        } else {
-            let _ = inner.nomination_complete.send(Some(false));
-            let _ = inner.set_state(IceTransportState::Failed);
-        }
     } else {
         // Controlled side: select best pair but don't nominate.
         // nomination_complete is signalled when we receive USE-CANDIDATE
@@ -2819,6 +2819,94 @@ fn commit_selected_pair(
     *inner.selected_pair.lock() = Some(pair.clone());
     let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
     publish_selected_socket(inner, socket, pair, inbound);
+    true
+}
+
+/// Commit and signal the outcome of one controlling-side nomination round.
+///
+/// Returns `false` when the round was dropped without touching session state:
+/// either an ICE restart superseded it (`round_generation` mismatch) or a
+/// concurrent round already nominated. RFC 8445 §8.1.1: the session keeps a
+/// single nominated pair — a late round must neither replace it nor fail the
+/// transport, even when its own USE-CANDIDATE goes unanswered (the controlled
+/// peer pins the first nomination it receives and ignores re-nomination).
+///
+/// Returns `true` when this round concluded the nomination state: it either
+/// committed a pair (signalling `Some(true)` on `nomination_complete`) or,
+/// when no pair could be committed at all, transitioned the transport to
+/// `Failed` and signalled `Some(false)`.
+fn complete_controlling_nomination(
+    inner: &Arc<IceTransportInner>,
+    round_generation: u64,
+    nominated_pair: Option<IceCandidatePair>,
+    successful_pairs: &[IceCandidatePair],
+) -> bool {
+    // Fall back to the highest-priority pair on all-fail so best-effort
+    // data still has a path.
+    let final_pair = nominated_pair
+        .clone()
+        .unwrap_or_else(|| successful_pairs[0].clone());
+    let nominated = nominated_pair.is_some();
+
+    let _selection = inner.selection_lock.lock();
+    // Re-check under the selection lock: a concurrent round may have
+    // completed its nomination while this round was still running its
+    // checks. A *successful* concurrent nomination is authoritative — keep
+    // it (RFC 8445 §8.1.1). A failed one (`Some(false)`) does not block this
+    // round: its fallback commit never received USE-CANDIDATE confirmation,
+    // so this round's nomination is the session's chance to converge.
+    if *inner.nomination_complete.borrow() == Some(true) {
+        debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
+            "ICE checks complete (controlling): a concurrent round already nominated; keeping its pair"
+        );
+        return false;
+    }
+    if inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst)
+        != round_generation
+    {
+        debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
+            "ICE checks complete (controlling): round superseded by a restart; dropping"
+        );
+        // Say nothing on `nomination_complete`: the restart reset it
+        // and the fresh round owns the state machine from here.
+        return false;
+    }
+
+    let committed = commit_selected_pair(inner, &final_pair, None);
+
+    if !committed {
+        // No socket serves the nominated pair (e.g. its socket was torn
+        // down between the check and this commit). Fail explicitly: a
+        // selected pair without a socket is a guaranteed blackhole, and
+        // keeping the previous half-updated selection silently is worse.
+        let _ = inner.nomination_complete.send(Some(false));
+        let _ = inner.set_state(IceTransportState::Failed);
+        return true;
+    }
+
+    debug!(
+        label = inner.config.label.as_deref().unwrap_or("-"),
+        "ICE checks complete. Selected pair: {} -> {}",
+        final_pair.local.address,
+        final_pair.remote.address
+    );
+
+    if nominated {
+        let _ = inner.nomination_complete.send(Some(true));
+    } else {
+        // No pair in this round could be nominated. Note the concurrent-round
+        // case never reaches here: the `nomination_lock` serializes rounds and
+        // the re-check above drops any round that lost the race, so a live
+        // nominated pair cannot be torn down by a late round (RFC 8445
+        // §8.1.1). What is left is a genuine first-round nomination failure —
+        // the controlled peer never received USE-CANDIDATE, so fail.
+        let _ = inner.nomination_complete.send(Some(false));
+        let _ = inner.set_state(IceTransportState::Failed);
+    }
     true
 }
 
