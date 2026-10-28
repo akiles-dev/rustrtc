@@ -6205,3 +6205,90 @@ fn test_nomination_grace_default_and_builder() {
         .build();
     assert_eq!(config.nomination_grace, Duration::from_millis(500));
 }
+
+// ===========================================================================
+// Post-nomination path upgrade (RFC 8445 §8.1.1 additional nomination)
+// ===========================================================================
+
+fn cand(addr: &str, priority: u32) -> IceCandidate {
+    let mut c = IceCandidate::host(addr.parse().unwrap(), 1);
+    c.priority = priority;
+    c
+}
+
+/// The only-upgrade rule: probe candidates must strictly exceed the selected
+/// pair's priority (never equal, never lower) and come back best-first.
+#[test]
+fn upgrade_candidate_pairs_only_higher_priority_best_first() {
+    let selected = IceCandidatePair::new(cand("10.0.0.1:100", 1000), cand("10.0.0.2:200", 1000));
+
+    let locals = vec![cand("10.0.0.1:100", 1000), cand("10.0.0.1:101", 900)];
+    let remotes = vec![
+        cand("10.0.0.2:200", 1000), // same as selected remote -> excluded via address match
+        cand("10.0.0.2:201", 1200), // higher -> included
+        cand("10.0.0.2:202", 1000), // equal -> excluded
+        cand("10.0.0.2:203", 800),  // lower -> excluded
+    ];
+
+    let out = upgrade_candidate_pairs(&locals, &remotes, &selected, IceRole::Controlling, 8);
+
+    assert!(
+        out.iter().all(|p| p.priority(IceRole::Controlling) > selected.priority(IceRole::Controlling)),
+        "every probed pair must strictly beat the selected pair"
+    );
+    assert!(!out.is_empty(), "the higher-priority pair must be probed");
+    let prios: Vec<u64> = out.iter().map(|p| p.priority(IceRole::Controlling)).collect();
+    let mut sorted = prios.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(prios, sorted, "probe order must be best-first");
+}
+
+/// End-to-end: after a session is nominated, a late-arriving
+/// higher-priority remote candidate (the "direct path validated after the
+/// session started on relay" scenario) must trigger a probe and an upgrade
+/// nomination on the controlling side. The remote address is a real peer
+/// socket (the controlled transport), so the STUN exchange is genuine.
+#[tokio::test]
+#[serial]
+async fn test_post_nomination_upgrade_to_higher_priority_pair() -> Result<()> {
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "pair must connect before the upgrade scenario"
+    );
+    let selected_before = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
+
+    // Simulate a strictly better path appearing late: same reachable peer
+    // socket, advertised with a higher candidate priority (a direct
+    // srflx/UPnP pair arriving after the session settled on relay).
+    let mut better = selected_before.remote.clone();
+    better.priority = selected_before.remote.priority.saturating_add(50_000);
+    // The trigger must be fully automatic: the re-armed checks driven by the
+    // late candidate probe the better path and upgrade the nomination.
+    controlling.add_remote_candidate(better.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut upgraded = None;
+    while tokio::time::Instant::now() < deadline {
+        let cur = controlling
+            .inner
+            .selected_pair
+            .lock()
+            .clone()
+            .unwrap_or_else(|| selected_before.clone());
+        if cur.remote.priority == better.priority {
+            upgraded = Some(cur);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let upgraded = upgraded.context("controlling side never upgraded to the higher-priority pair")?;
+    assert!(
+        upgraded.priority(IceRole::Controlling) > selected_before.priority(IceRole::Controlling),
+        "upgraded pair must outrank the original selection"
+    );
+    Ok(())
+}

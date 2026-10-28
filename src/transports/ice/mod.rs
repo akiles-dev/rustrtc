@@ -169,7 +169,7 @@ impl UpnpPortMapper {
 }
 use crate::platform::sync::{AsyncMutex as Mutex, broadcast, mpsc, oneshot, watch};
 use crate::platform::time::with_timeout;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -2303,6 +2303,14 @@ impl IceTransport {
 async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     let state = *inner.state.borrow();
     if state != IceTransportState::Checking {
+        // A re-armed round on an already-connected transport is the trigger
+        // to probe for a strictly better path and upgrade the nomination
+        // (RFC 8445 §8.1.1 additional nomination): a session that had to
+        // start on the always-fast relay pair moves to a direct path that
+        // validated later, with no setup-latency cost and no ICE restart.
+        if state == IceTransportState::Connected || state == IceTransportState::Completed {
+            let _ = try_upgrade_nominated_path(inner.clone()).await;
+        }
         return;
     }
 
@@ -2911,6 +2919,167 @@ fn complete_controlling_nomination(
         let _ = inner.set_state(IceTransportState::Failed);
     }
     true
+}
+
+/// Pairs worth probing for a post-nomination path upgrade: every
+/// local×remote combination (same transport/component/address-family rules
+/// as the initial check round) whose pair priority STRICTLY exceeds the
+/// currently selected pair's, best first, bounded. Pure so the only-upgrade
+/// rule is unit-testable.
+fn upgrade_candidate_pairs(
+    locals: &[IceCandidate],
+    remotes: &[IceCandidate],
+    selected: &IceCandidatePair,
+    role: IceRole,
+    limit: usize,
+) -> Vec<IceCandidatePair> {
+    let floor = selected.priority(role);
+    let mut pairs: Vec<IceCandidatePair> = Vec::new();
+    for local in locals {
+        for remote in remotes {
+            if local.transport != remote.transport
+                || local.component != remote.component
+                || local.address.is_ipv4() != remote.address.is_ipv4()
+            {
+                continue;
+            }
+            if local.address.ip().is_loopback() && !remote.address.ip().is_loopback() {
+                continue;
+            }
+            // NOTE: no address-based exclusion here — a different candidate
+            // at the same address (e.g. a re-advertised host candidate with
+            // an updated priority, or prflx alongside host) is a legitimate
+            // upgrade target. The strict priority floor below already rules
+            // out the currently selected pair itself.
+            let pair = IceCandidatePair::new(local.clone(), remote.clone());
+            if pair.priority(role) > floor {
+                pairs.push(pair);
+            }
+        }
+    }
+    pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(role)));
+    pairs.truncate(limit);
+    pairs
+}
+
+/// Post-nomination path upgrade (controlling side only). RFC 8445 §8.1.1
+/// allows the controlling agent to nominate an additional pair after the
+/// first: a session that had to start on the always-fast relay pair (a
+/// cross-ISP direct pair typically validates a few hundred ms later) is
+/// moved onto the better path as soon as that path proves itself.
+///
+/// Triggered from the post-selection gate of
+/// [`perform_connectivity_checks_async`]: every late trickle candidate or
+/// peer-reflexive discovery re-arms checks, and an already-nominated
+/// controlling agent uses that as the probe trigger. For each strictly
+/// higher-priority pair: ordinary binding check → USE-CANDIDATE (the
+/// upgrade nomination) → atomic commit. The controlled peer verifies and
+/// follows via the inbound `use_candidate` handler
+/// (`verify_nominated_path` + `commit_verified_nomination`).
+///
+/// Safety: only-upgrade (a candidate must beat the current selection's
+/// priority, so the path can never oscillate downwards), serialized with
+/// nomination rounds via `nomination_lock`, and aborted by ICE restarts via
+/// the generation counter. Returns `true` when the selected pair was
+/// upgraded.
+async fn try_upgrade_nominated_path(inner: Arc<IceTransportInner>) -> bool {
+    // Only a successfully nominated controlling agent upgrades.
+    if *inner.nomination_complete.borrow() != Some(true) {
+        return false;
+    }
+    let role = *inner.role.lock();
+    if role != IceRole::Controlling {
+        return false;
+    }
+    let round_generation = inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+
+    let selected = inner.selected_pair.lock().clone();
+    let Some(selected) = selected else {
+        return false;
+    };
+
+    let locals = inner.gatherer.local_candidates();
+    let remotes = inner.remote_candidates.lock().clone();
+    let candidates = upgrade_candidate_pairs(&locals, &remotes, &selected, role, 8);
+    if candidates.is_empty() {
+        return false;
+    }
+    debug!(
+        label = inner.config.label.as_deref().unwrap_or("-"),
+        "ICE upgrade pass: {} pair(s) with priority above the selected pair probed",
+        candidates.len()
+    );
+
+    let started = crate::platform::time::Instant::now();
+    for pair in candidates {
+        if started.duration_since(crate::platform::time::Instant::now())
+            >= inner.config.nomination_timeout
+        {
+            break;
+        }
+        if inner
+            .nomination_generation
+            .load(core::sync::atomic::Ordering::SeqCst)
+            != round_generation
+        {
+            // ICE restart superseded this pass; the fresh round owns the
+            // state machine from here.
+            return false;
+        }
+        // Step 1 — ordinary check: does the better path even work?
+        if perform_binding_check(&pair.local, &pair.remote, &inner, role, false)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        // Step 2 — upgrade nomination, serialized against nomination rounds
+        // and other upgrade passes.
+        let _nomination_guard = inner.nomination_lock.lock().await;
+        if *inner.nomination_complete.borrow() != Some(true) {
+            return false;
+        }
+        if inner
+            .nomination_generation
+            .load(core::sync::atomic::Ordering::SeqCst)
+            != round_generation
+        {
+            return false;
+        }
+        let still_an_upgrade = inner
+            .selected_pair
+            .lock()
+            .as_ref()
+            .map(|cur| cur.priority(role) < pair.priority(role))
+            .unwrap_or(false);
+        if !still_an_upgrade {
+            // Another pass already upgraded to something at least as good.
+            return false;
+        }
+        match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
+            Ok(_) => {
+                let committed = {
+                    let _selection = inner.selection_lock.lock();
+                    commit_selected_pair(&inner, &pair, None)
+                };
+                if committed {
+                    info!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
+                        "ICE path upgrade: selected pair -> {} {} (priority {} > {})",
+                        pair.local.address,
+                        pair.remote.address,
+                        pair.priority(role),
+                        selected.priority(role)
+                    );
+                    return true;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    false
 }
 
 /// Resolve the socket that serves `pair`.
