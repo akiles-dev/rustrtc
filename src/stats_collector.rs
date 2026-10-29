@@ -91,6 +91,8 @@ struct LocalInboundStats {
     initialized: bool,
     /// Interarrival jitter estimate (RTP timestamp units).
     jitter: u32,
+    /// The same, times 16: RFC 3550 A.8 fixed point (see `jitter_step`).
+    jitter_q4: u32,
     last_rtp_ts: u32,
     last_arrival_rtp: u32,
     transit_init: bool,
@@ -110,6 +112,7 @@ impl Default for LocalInboundStats {
             cycles: 0,
             initialized: false,
             jitter: 0,
+            jitter_q4: 0,
             last_rtp_ts: 0,
             last_arrival_rtp: 0,
             transit_init: false,
@@ -152,8 +155,8 @@ impl LocalInboundStats {
         if self.transit_init {
             let d = (arrival_units as i64 - self.last_arrival_rtp as i64)
                 - (rtp_ts as i64 - self.last_rtp_ts as i64);
-            let ad = d.unsigned_abs() as i64;
-            self.jitter = ((self.jitter as i64) + ((ad - self.jitter as i64) / 16)) as u32;
+            self.jitter_q4 = jitter_step(self.jitter_q4, d);
+            self.jitter = self.jitter_q4 >> 4;
         } else {
             self.transit_init = true;
         }
@@ -208,6 +211,15 @@ impl LocalInboundStats {
             delay_since_last_sender_report: delay_since_last_sr,
         }
     }
+}
+
+/// One step of the RFC 3550 A.8 jitter estimate, J += (|D| - J) / 16, with
+/// J times 16 (`jitter_q4`) as in the RFC's fixed-point code. With J in
+/// whole units, the integer division dropped every change under 16 units
+/// (2 ms at 8 kHz): the estimate stayed at 0 on a good network.
+fn jitter_step(jitter_q4: u32, d: i64) -> u32 {
+    let j = jitter_q4 as i64;
+    (j + d.abs() - ((j + 8) >> 4)).clamp(0, u32::MAX as i64) as u32
 }
 
 #[derive(Debug, Clone)]
@@ -676,5 +688,26 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].ssrc, 42);
         assert!(blocks[0].packets_lost >= 4);
+    }
+
+    /// Run the jitter estimate over (arrival delta, RTP timestamp delta)
+    /// steps. Returns J in units.
+    fn run_jitter(steps: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+        let mut q4 = 0;
+        for (arrival, ts) in steps {
+            q4 = jitter_step(q4, arrival as i64 - ts as i64);
+        }
+        q4 >> 4
+    }
+
+    #[test]
+    fn jitter_sees_small_differences() {
+        // 8 kHz, packets every 160 units, arriving 4 units (0.5 ms) early and
+        // late in turn: |D| is 8 every time, so J tends to 8. With J in whole
+        // units, (8 - J) / 16 was 0 and J stayed 0.
+        let steps = (0..500).map(|i| (if i % 2 == 0 { 168 } else { 152 }, 160));
+        assert_eq!(run_jitter(steps), 7);
+        // Perfect pacing: no jitter.
+        assert_eq!(run_jitter((0..500).map(|_| (160, 160))), 0);
     }
 }
