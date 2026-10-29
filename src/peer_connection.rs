@@ -14028,6 +14028,125 @@ a=mid:0
         pc.close();
     }
 
+    /// ICE-lite without rtcp-mux: Linphone checks and nominates both
+    /// components, RTP (1) and RTCP (2). Only the RTP nomination may select
+    /// the media pair. A nomination on our RTCP socket used to become the
+    /// media pair: RTP then went out from our RTCP port, to the phone's RTCP
+    /// port unless latching kept its RTP port. A NAT that filters by source
+    /// port drops that.
+    #[tokio::test]
+    async fn ice_lite_rtcp_component_nomination_keeps_rtp_pair() {
+        use crate::TransportMode;
+        use crate::transports::ice::stun::{StunAttribute, StunClass, StunMessage};
+
+        let phone_rtp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_rtcp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (rtp_addr, rtcp_addr) = (
+            phone_rtp.local_addr().unwrap(),
+            phone_rtcp.local_addr().unwrap(),
+        );
+        let phone_pwd = "phonepasswordphonepassword";
+        let remote_offer = format!(
+            "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.253\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.253\r\n\
+t=0 0\r\n\
+a=ice-ufrag:phon\r\n\
+a=ice-pwd:{phone_pwd}\r\n\
+m=audio 42760 RTP/SAVP 0\r\n\
+a=rtcp:38517\r\n\
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=candidate:1 1 UDP 2130706303 10.0.0.253 42760 typ host\r\n\
+a=candidate:1 2 UDP 2130706302 10.0.0.253 38517 typ host\r\n\
+a=sendrecv\r\n"
+        );
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        config.enable_ice_lite = true;
+        config.enable_latching = true;
+        config.bind_ip = Some("127.0.0.1".to_string());
+        let pc = PeerConnection::new(config);
+        let offer = SessionDescription::parse(SdpType::Offer, &remote_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+
+        let section = &answer.media_sections[0];
+        let attr = |key: &str| {
+            section
+                .attributes
+                .iter()
+                .find(|a| a.key == key)
+                .and_then(|a| a.value.clone())
+                .unwrap_or_else(|| panic!("no a={key}"))
+        };
+        let (our_ufrag, our_pwd) = (attr("ice-ufrag"), attr("ice-pwd"));
+        let our_rtp: core::net::SocketAddr = format!("127.0.0.1:{}", section.port).parse().unwrap();
+        let our_rtcp: core::net::SocketAddr =
+            format!("127.0.0.1:{}", attr("rtcp")).parse().unwrap();
+
+        // The phone's checks, each from its own socket to the matching one of
+        // ours: RTP nominated first, RTCP last. The phone answers the
+        // node's checks of a new path.
+        let nominate = |priority: u32| {
+            let mut check = StunMessage::binding_request(rand::random(), None);
+            check.attributes = vec![
+                StunAttribute::Username(format!("{our_ufrag}:phon")),
+                StunAttribute::Priority(priority),
+                StunAttribute::IceControlling(42),
+                StunAttribute::UseCandidate,
+            ];
+            check.encode(Some(our_pwd.as_bytes()), true).unwrap()
+        };
+        /// Answers the node's checks; true if the phone's check got a
+        /// success response.
+        async fn serve(socket: &tokio::net::UdpSocket, pwd: &str) -> bool {
+            let mut buf = [0u8; 1500];
+            let mut answered = false;
+            while let Ok(Ok((n, from))) =
+                tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await
+            {
+                match StunMessage::decode(&buf[..n]).map(|m| (m.class, m.transaction_id)) {
+                    Ok((StunClass::SuccessResponse, _)) => answered = true,
+                    Ok((StunClass::Request, id)) => {
+                        let resp = StunMessage::binding_success_response(id, from);
+                        let bytes = resp.encode(Some(pwd.as_bytes()), true).unwrap();
+                        socket.send_to(&bytes, from).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            answered
+        }
+        phone_rtp
+            .send_to(&nominate(2130706303), our_rtp)
+            .await
+            .unwrap();
+        assert!(serve(&phone_rtp, phone_pwd).await, "RTP check answered");
+        phone_rtcp
+            .send_to(&nominate(2130706302), our_rtcp)
+            .await
+            .unwrap();
+        assert!(serve(&phone_rtcp, phone_pwd).await, "RTCP check answered");
+        serve(&phone_rtp, phone_pwd).await;
+
+        let pair = pc.inner.ice_transport.get_selected_pair().unwrap();
+        assert_eq!(
+            pair.remote.address, rtp_addr,
+            "media goes to the phone's RTP port"
+        );
+        assert_eq!(
+            pair.local.base_address(),
+            our_rtp,
+            "media leaves from our RTP socket"
+        );
+        assert_ne!(pair.remote.address, rtcp_addr);
+        pc.close();
+    }
+
     #[tokio::test]
     async fn rtp_mode_midless_reinvite_reactivates_existing_video_transceiver() {
         use crate::TransportMode;
