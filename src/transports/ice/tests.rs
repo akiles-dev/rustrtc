@@ -939,6 +939,14 @@ async fn setup_host_pair(
     tokio::spawn(runner_d);
 
     // Exchange already-gathered candidates.
+    // Gathering is asynchronous (the runner task drives it): wait for host
+    // candidates before exchanging, so the exchange actually delivers them.
+    let gather_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < gather_deadline
+        && (controlling.local_candidates().is_empty() || controlled.local_candidates().is_empty())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     for c in controlling.local_candidates() {
         controlled.add_remote_candidate(c);
     }
@@ -4409,6 +4417,14 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Gathering is asynchronous (the runner task drives it): wait for host
+    // candidates before exchanging, so the exchange actually delivers them.
+    let gather_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < gather_deadline
+        && (controlling.local_candidates().is_empty() || controlled.local_candidates().is_empty())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     for c in controlling.local_candidates() {
         controlled.add_remote_candidate(c);
     }
@@ -6289,6 +6305,320 @@ async fn test_post_nomination_upgrade_to_higher_priority_pair() -> Result<()> {
     assert!(
         upgraded.priority(IceRole::Controlling) > selected_before.priority(IceRole::Controlling),
         "upgraded pair must outrank the original selection"
+    );
+    Ok(())
+}
+
+/// RFC 8445 §6.1.4.4 reproduction: every pair in the check list must reach a
+/// terminal state (Succeeded / Failed-by-STUN-retransmission). A
+/// higher-priority pair whose response arrives after the nomination grace
+/// must still validate — in the SAME round — and upgrade the nomination.
+/// Abandoning in-flight checks at an arbitrary grace timer leaves the pair
+/// invisible forever and pins the session to the lower-priority path.
+#[tokio::test]
+#[serial]
+async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<()> {
+    // Manual setup (mirrors setup_host_pair) so the slow candidate is present
+    // BEFORE checks start — no late-trickle re-arm may rescue the round.
+    let (controlling, runner_c) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Gathering is asynchronous (the runner task drives it): wait for host
+    // candidates before exchanging, so the exchange actually delivers them.
+    let gather_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < gather_deadline
+        && (controlling.local_candidates().is_empty() || controlled.local_candidates().is_empty())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+
+    // Delaying UDP relay: a "slow but strictly better path" to the same peer.
+    // 700 ms one-way delay on requests; responses relayed immediately.
+    let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let proxy_addr = proxy.local_addr()?;
+    let peer = controlled
+        .local_candidates()
+        .into_iter()
+        .map(|c| c.address)
+        .next()
+        .context("controlled has no host candidate")?;
+    let delay = Duration::from_millis(700);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut client: Option<SocketAddr> = None;
+        while let Ok((len, from)) = proxy.recv_from(&mut buf).await {
+            if from == peer {
+                if let Some(c) = client {
+                    let _ = proxy.send_to(&buf[..len], c).await;
+                }
+            } else {
+                client = Some(from);
+                tokio::time::sleep(delay).await;
+                let _ = proxy.send_to(&buf[..len], peer).await;
+            }
+        }
+    });
+
+    let mut slow = IceCandidate::host(proxy_addr, 1);
+    slow.priority = slow.priority.saturating_add(50_000);
+    controlling.add_remote_candidate(slow);
+
+    // Dead paths (partial unreachability): a closed port and a blackholed
+    // one, one advertised with a priority ABOVE the slow path. Dead paths
+    // must never delay the initial nomination nor corrupt the upgrade —
+    // they simply never validate and are ignored.
+    let dead_high = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        s.local_addr()?
+    }; // closed immediately -> ICMP unreachable, fast fail
+    let dead_low = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        s.local_addr()?
+    };
+    let mut dh = IceCandidate::host(dead_high, 1);
+    dh.priority = dh.priority.saturating_add(80_000);
+    let dl = IceCandidate::host(dead_low, 1);
+    controlling.add_remote_candidate(dh);
+    controlling.add_remote_candidate(dl);
+
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "pair must connect on the fast path first"
+    );
+
+    // The slow pair's response lands ~700 ms in — after the 200 ms grace.
+    // The selection must eventually upgrade to it (check-list completion,
+    // then the controlling agent nominates the better validated pair).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut upgraded = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(p) = controlling.inner.selected_pair.lock().clone() {
+            if p.remote.address == proxy_addr {
+                upgraded = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        upgraded,
+        "higher-priority pair validating after the grace must upgrade the selection"
+    );
+    Ok(())
+}
+
+/// Multi-homed regression (cf. the EHOSTDOWN incident behind the atomic
+/// `commit_selected_pair`): the post-nomination upgrade must publish the
+/// socket of the NEW pair's local candidate when the upgrade lands on a
+/// different local interface than the originally nominated pair. The slow
+/// higher-priority path is only reachable from the loopback local — the LAN
+/// local's checks toward it are dropped by the relay — so the upgrade pair is
+/// guaranteed to use a different local socket.
+#[tokio::test]
+#[serial]
+async fn test_upgrade_across_local_interfaces_publishes_correct_socket() -> Result<()> {
+    let mut cfg = RtcConfiguration::default();
+    cfg.ice_include_loopback_candidates = true;
+
+    let (controlling, runner_c) = IceTransportBuilder::new(cfg)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::default())
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    let gather_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < gather_deadline
+        && (controlling.local_candidates().is_empty() || controlled.local_candidates().is_empty())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let loopback_local = controlling
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.address.ip().is_loopback())
+        .context("no loopback local candidate (include_loopback)")?;
+    let lan_local = controlling
+        .local_candidates()
+        .into_iter()
+        .find(|c| !c.address.ip().is_loopback())
+        .context("no non-loopback local candidate")?;
+
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+
+    // Selective delaying relay: only forwards requests SENT FROM the loopback
+    // local (source ip 127.0.0.1); requests from the LAN local are dropped so
+    // the (LAN local -> proxy) pair can never validate.
+    let proxy = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let proxy_addr = SocketAddr::new(
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        proxy.local_addr()?.port(),
+    );
+    let peer = controlled
+        .local_candidates()
+        .into_iter()
+        .map(|c| c.address)
+        .next()
+        .context("controlled has no host candidate")?;
+    let delay = Duration::from_millis(700);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut client: Option<SocketAddr> = None;
+        while let Ok((len, from)) = proxy.recv_from(&mut buf).await {
+            if from == peer {
+                if let Some(c) = client {
+                    let _ = proxy.send_to(&buf[..len], c).await;
+                }
+            } else if from.ip().is_loopback() {
+                client = Some(from);
+                tokio::time::sleep(delay).await;
+                let _ = proxy.send_to(&buf[..len], peer).await;
+            }
+            // Non-loopback sources (the LAN local) are dropped on purpose.
+        }
+    });
+
+    let mut slow = IceCandidate::host(proxy_addr, 1);
+    slow.priority = lan_local.priority.saturating_add(50_000);
+    controlling.add_remote_candidate(slow);
+
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "fast LAN path must connect first"
+    );
+
+    // The upgrade must land on the loopback local (only reachable source).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut upgraded = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(p) = controlling.inner.selected_pair.lock().clone() {
+            if p.remote.address == proxy_addr {
+                upgraded = Some(p);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let upgraded = upgraded.context("upgrade never landed")?;
+    assert!(
+        upgraded.local.address.ip().is_loopback(),
+        "upgrade pair must use the loopback local (different socket), got {}",
+        upgraded.local.address
+    );
+    // The published socket must serve the NEW pair's local, not the old one.
+    let sock = controlling
+        .inner
+        .selected_socket
+        .borrow()
+        .clone()
+        .context("no selected socket after upgrade")?;
+    let bound = sock
+        .local_addr()
+        .context("socket local_addr")?;
+    assert!(
+        bound.ip().is_loopback(),
+        "published socket must be the loopback-local socket, got {}",
+        bound
+    );
+    Ok(())
+}
+
+/// Monotonicity: after an upgrade to a higher-priority pair, later rounds
+/// validating lower-priority pairs must never downgrade the selection.
+#[tokio::test]
+#[serial]
+async fn test_no_downgrade_after_upgrade() -> Result<()> {
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+    let mut ctrl_state = controlling.subscribe_state();
+    assert!(wait_ice_connected(ctrl_state, Duration::from_secs(10)).await);
+    let base = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
+
+    // Upgrade to an inflated-priority alias of the peer (same reachable socket).
+    let mut better = base.remote.clone();
+    better.priority = base.remote.priority.saturating_add(50_000);
+    controlling.add_remote_candidate(better.clone());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let cur = controlling.inner.selected_pair.lock().clone();
+        if matches!(&cur, Some(p) if p.remote.priority == better.priority) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        matches!(
+            &*controlling.inner.selected_pair.lock(),
+            Some(p) if p.remote.priority == better.priority
+        ),
+        "upgrade must have happened before the downgrade attempt"
+    );
+
+    // Now a lower-priority path validates (a fresh normal-priority remote): a
+    // new round runs, but only-upgrade must reject it.
+    let extra = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        s.local_addr()?
+    };
+    let low = IceCandidate::host(extra, 1);
+    controlling.add_remote_candidate(low);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        matches!(
+            &*controlling.inner.selected_pair.lock(),
+            Some(p) if p.remote.priority == better.priority
+        ),
+        "selection must never downgrade after an upgrade"
+    );
+    Ok(())
+}
+
+/// Performance guard: a healthy host-only negotiation must complete quickly —
+/// guards against regressions that extend the nomination grace handling into
+/// connection-setup latency.
+#[tokio::test]
+#[serial]
+async fn test_healthy_connect_latency_bound() -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+    let mut ctrl_state = controlling.subscribe_state();
+    assert!(wait_ice_connected(ctrl_state, Duration::from_secs(10)).await);
+    let _ = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "healthy connect+nomination took {:?} — setup latency regression",
+        elapsed
     );
     Ok(())
 }

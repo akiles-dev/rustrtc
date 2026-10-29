@@ -2427,6 +2427,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         });
     }
 
+    // Highest achievable pair priority within this round's candidate space
+    // (locals × remotes snapshot). Once the selected pair carries it, no
+    // nomination upgrade is possible and the round may terminate immediately
+    // instead of lingering until the slowest failing check exhausts its STUN
+    // retransmissions — keeps the healthy case (best direct path nominated
+    // first) at zero extra cost. Information-based, not a timer.
+    let max_possible_priority = pairs.iter().map(|p| p.priority(role)).max().unwrap_or(0);
+
     let mut pairs_to_check = Vec::new();
     {
         let mut checking = inner.checking_pairs.lock().await;
@@ -2442,6 +2450,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     if pairs_to_check.is_empty() {
         return;
     }
+
     let mut checks = futures::stream::FuturesUnordered::new();
 
     for pair in pairs_to_check {
@@ -2486,18 +2495,39 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     use futures::stream::StreamExt;
     let mut successful_pairs: Vec<IceCandidatePair> = Vec::new();
 
-    // Collect successful pairs. Once the first usable pair arrives, only wait a
-    // short grace window for additional (possibly higher-priority) pairs before
-    // proceeding to nomination. This keeps a single unreachable candidate (e.g.
-    // a stale LAN host candidate returning EHOSTDOWN/EHOSTUNREACH) from stalling
-    // connection setup for the full STUN timeout — all checks still run
-    // concurrently, but nomination is no longer gated on the slowest failing pair.
-    // The grace is configurable (`nomination_grace`): a longer window lets
-    // higher-priority direct pairs (cross-ISP RTT) validate before nomination
-    // instead of losing the race to the always-fast relay pair.
+    // Collect check results. Every pair runs to a terminal state — Succeeded
+    // on response, Failed by STUN retransmission (RFC 8445 §6.1.4.4 with the
+    // RFC 5389 §7.2.1 retransmission timing as the only failure bound). The
+    // loop is never abandoned at an arbitrary timer: `nomination_grace` only
+    // decides when the FIRST nomination happens (an embedder-tunable strategy
+    // knob for trading setup latency for path quality). After that nomination
+    // the round keeps collecting, and any pair that later validates with a
+    // priority above the current selection upgrades the nomination
+    // (RFC 8445 §8.1.1 additional nomination) — this is what lets a session
+    // that started on the always-fast relay pair move to a direct path that
+    // validates a few hundred ms later.
     let nomination_grace = inner.config.nomination_grace;
+    let mut nominated = false;
     loop {
-        let next = if successful_pairs.is_empty() {
+        // Early exit: the selection already carries the best priority this
+        // round's candidate space can produce — nothing left to upgrade to,
+        // so don't wait out the slowest failing check's retransmissions.
+        if nominated
+            && role == IceRole::Controlling
+            && inner
+                .selected_pair
+                .lock()
+                .as_ref()
+                .map(|p| p.priority(role) >= max_possible_priority)
+                .unwrap_or(false)
+        {
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE check round complete early: selected pair already at max priority"
+            );
+            break;
+        }
+        let next = if successful_pairs.is_empty() || (nominated && role == IceRole::Controlling) {
             checks.next().await
         } else {
             // checks arm polled first each wake (matches the old `biased;`).
@@ -2505,7 +2535,23 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             let mut grace_fut = core::pin::pin!(crate::platform::task::sleep(nomination_grace));
             match crate::platform::select::select2(&mut checks_fut, &mut grace_fut).await {
                 crate::platform::select::Either::A(res) => res,
-                crate::platform::select::Either::B(_) => break,
+                crate::platform::select::Either::B(_) => {
+                    if role == IceRole::Controlling {
+                        // Controlling: nominate with what has validated, then
+                        // keep draining the check list for later upgrades.
+                        nominate_best_pair(&inner, round_generation, &mut successful_pairs).await;
+                        nominated = true;
+                        continue;
+                    } else {
+                        // Controlled: conclude the round at the grace
+                        // (historical behaviour) — its selection runs after
+                        // the loop, and the slowest failing check must not
+                        // delay it. Later rounds (trickle / peer-reflexive)
+                        // re-run as usual, and USE-CANDIDATE moves the
+                        // selection regardless.
+                        break;
+                    }
+                }
             }
         };
 
@@ -2518,6 +2564,11 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                         .iter()
                         .any(|p| (p.local.address, p.remote.address) == key)
                     {
+                        if nominated && role == IceRole::Controlling {
+                            // Validated after the nomination: if it outranks
+                            // the current selection, upgrade (event-driven).
+                            maybe_upgrade_on_success(&inner, &pair);
+                        }
                         successful_pairs.push(pair);
                     }
                 }
@@ -2534,132 +2585,26 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         return;
     }
 
-    // Sort by priority: host > srflx > relay.  P2P first, relay last.
-    successful_pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(role)));
-
-    for p in &successful_pairs {
-        debug!(
-            label = inner.config.label.as_deref().unwrap_or("-"),
-            "ICE successful pair ({}): local {} {:?} -> remote {} {:?}",
-            if role == IceRole::Controlling {
-                "controlling"
-            } else {
-                "controlled"
-            },
-            p.local.address,
-            p.local.typ,
-            p.remote.address,
-            p.remote.typ
-        );
-    }
-
     if role == IceRole::Controlling {
-        // Signal Connected so the PeerConnection starts waiting for nomination_complete.
-        let _ = inner.set_state(IceTransportState::Connected);
-
-        // Serialize the nomination phase across concurrent check rounds (see
-        // `nomination_lock`). A late trickle candidate spawns a fresh round
-        // while this round may still be mid-nomination; both would pass the
-        // `already nominated` guard below (both read `None`), race to commit,
-        // and the loser — whose USE-CANDIDATE the controlled peer ignores —
-        // would tear down the freshly nominated session.
-        let _nomination_guard = inner.nomination_lock.lock().await;
-
-        // Nominate once. Late trickle candidates re-trigger connectivity checks;
-        // re-nominating on every round would make the controlled peer flap
-        // between pairs (RFC 8445 nominates a single pair for the session —
-        // re-nomination is only expected after an ICE restart, which resets
-        // nomination state). Only a *successful* nomination blocks follow-up
-        // rounds: if the previous round's USE-CANDIDATE went unanswered
-        // (`Some(false)`, e.g. heavy loss), a fresh round may still retry —
-        // losing rounds must be able to heal the session, not abandon it.
-        if *inner.nomination_complete.borrow() == Some(true) {
-            debug!(
-                label = inner.config.label.as_deref().unwrap_or("-"),
-                "ICE checks complete (controlling): already nominated, keeping selected pair"
-            );
-            return;
+        if !nominated {
+            // The check list drained before the grace expired: every result
+            // is known — nominate with complete information.
+            nominate_best_pair(&inner, round_generation, &mut successful_pairs).await;
         }
-
-        // RFC 8445 regular nomination: send USE-CANDIDATE on exactly ONE pair
-        // — the highest-priority pair that passed connectivity checks
-        // (`successful_pairs` is already sorted best-first). Nominating every
-        // successful pair in parallel (the previous behaviour) sends
-        // USE-CANDIDATE on multiple pairs, leaving the controlled peer unable
-        // to tell which is authoritative; it had to freeze/guess, and when a
-        // real controlling peer later re-nominated (e.g. a browser abandoning
-        // a dead srflx path for its relay) the frozen side kept DTLS pointed
-        // at the stale address and the handshake never completed. A single
-        // authoritative nomination makes re-nomination unambiguous.
-        //
-        // Try pairs in priority order; a nomination binding check can still be
-        // lost, so fall through to the next successful pair. Bound the whole
-        // phase to a single nomination_timeout so a lossy link cannot multiply
-        // the latency by the candidate count (which previously stalled setup
-        // for N × nomination_timeout under high packet loss).
-        let nomination_start = crate::platform::time::Instant::now();
-        let mut nominated_pair: Option<IceCandidatePair> = None;
-        for (idx, pair) in successful_pairs.iter().enumerate() {
-            // Bail out early if an ICE restart superseded this round: holding
-            // the nomination lock through a doomed nomination would delay the
-            // fresh post-restart round by up to nomination_timeout.
-            if inner
-                .nomination_generation
-                .load(core::sync::atomic::Ordering::SeqCst)
-                != round_generation
-            {
-                debug!(
-                    label = inner.config.label.as_deref().unwrap_or("-"),
-                    "ICE nomination aborted: round superseded by a restart"
-                );
-                break;
-            }
-            // Always attempt the best pair; only bound the fallbacks.
-            if idx > 0
-                && crate::platform::time::Instant::now().duration_since(nomination_start)
-                    >= inner.config.nomination_timeout
-            {
-                debug!("Nomination deadline reached before trying all candidate pairs");
-                break;
-            }
-            debug!(
-                label = inner.config.label.as_deref().unwrap_or("-"),
-                "Controlling agent nominating pair: {} -> {}",
-                pair.local.address,
-                pair.remote.address
-            );
-            match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
-                Ok(_) => {
-                    debug!(
-                        label = inner.config.label.as_deref().unwrap_or("-"),
-                        "Nomination succeeded: {} -> {}", pair.local.address, pair.remote.address
-                    );
-                    nominated_pair = Some(pair.clone());
-                    break;
-                }
-                Err(e) => {
-                    debug!(
-                        label = inner.config.label.as_deref().unwrap_or("-"),
-                        "Nomination failed for {} -> {}: {}",
-                        pair.local.address,
-                        pair.remote.address,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Commit and signal this round's outcome. `complete_controlling_nomination`
-        // re-checks nomination state under the selection lock (RFC 8445 §8.1.1:
-        // a concurrent round's nomination, if it won the race, is authoritative
-        // and this round must neither stomp it nor fail the transport).
-        complete_controlling_nomination(
-            &inner,
-            round_generation,
-            nominated_pair,
-            &successful_pairs,
-        );
     } else {
+        // Sort by priority: host > srflx > relay.  P2P first, relay last.
+        successful_pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(role)));
+
+        for p in &successful_pairs {
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE successful pair (controlled): local {} {:?} -> remote {} {:?}",
+                p.local.address,
+                p.local.typ,
+                p.remote.address,
+                p.remote.typ
+            );
+        }
         // Controlled side: select best pair but don't nominate.
         // nomination_complete is signalled when we receive USE-CANDIDATE
         // from the controlling agent.
@@ -2831,6 +2776,192 @@ fn commit_selected_pair(
     let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
     publish_selected_socket(inner, socket, pair, inbound);
     true
+}
+
+/// Perform the controlling side's first nomination for a check round: sort
+/// the validated pairs, pick the best, send USE-CANDIDATE, and commit via
+/// [`complete_controlling_nomination`]. Serialized across concurrent rounds
+/// by `nomination_lock`; a round that lost the race (or was superseded by an
+/// ICE restart) drops without touching session state.
+async fn nominate_best_pair(
+    inner: &Arc<IceTransportInner>,
+    round_generation: u64,
+    successful_pairs: &mut Vec<IceCandidatePair>,
+) {
+    // Sort by priority: host > srflx > relay.  P2P first, relay last.
+    successful_pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(IceRole::Controlling)));
+
+    for p in successful_pairs.iter() {
+        debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
+            "ICE successful pair (controlling): local {} {:?} -> remote {} {:?}",
+            p.local.address,
+            p.local.typ,
+            p.remote.address,
+            p.remote.typ
+        );
+    }
+
+    // Signal Connected so the PeerConnection starts waiting for nomination_complete.
+    let _ = inner.set_state(IceTransportState::Connected);
+
+    // Serialize the nomination phase across concurrent check rounds (see
+    // `nomination_lock`): a late trickle candidate spawns a fresh round while
+    // this one may still be mid-nomination; without the lock both would pass
+    // the `already nominated` guard and race to commit.
+    let _nomination_guard = inner.nomination_lock.lock().await;
+
+    // Nominate once per session (RFC 8445 regular nomination): a single
+    // authoritative USE-CANDIDATE. Later, strictly-better validated pairs
+    // upgrade the nomination instead (see `maybe_upgrade_on_success`). Only a
+    // *successful* nomination blocks follow-up rounds: after a failed one
+    // (`Some(false)`, e.g. heavy loss) a fresh round may still retry.
+    if *inner.nomination_complete.borrow() == Some(true) {
+        debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
+            "ICE checks complete (controlling): already nominated, keeping selected pair"
+        );
+        return;
+    }
+
+    // Try pairs in priority order; a nomination binding check can still be
+    // lost, so fall through to the next successful pair. Bound the whole
+    // phase to a single nomination_timeout so a lossy link cannot multiply
+    // the latency by the candidate count.
+    let nomination_start = crate::platform::time::Instant::now();
+    let mut nominated_pair: Option<IceCandidatePair> = None;
+    for (idx, pair) in successful_pairs.iter().enumerate() {
+        // Bail out early if an ICE restart superseded this round.
+        if inner
+            .nomination_generation
+            .load(core::sync::atomic::Ordering::SeqCst)
+            != round_generation
+        {
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE nomination aborted: round superseded by a restart"
+            );
+            break;
+        }
+        // Always attempt the best pair; only bound the fallbacks.
+        if idx > 0
+            && crate::platform::time::Instant::now().duration_since(nomination_start)
+                >= inner.config.nomination_timeout
+        {
+            debug!("Nomination deadline reached before trying all candidate pairs");
+            break;
+        }
+        debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
+            "Controlling agent nominating pair: {} -> {}",
+            pair.local.address,
+            pair.remote.address
+        );
+        match perform_binding_check(&pair.local, &pair.remote, inner, IceRole::Controlling, true)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "Nomination succeeded: {} -> {}", pair.local.address, pair.remote.address
+                );
+                nominated_pair = Some(pair.clone());
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "Nomination failed for {} -> {}: {}",
+                    pair.local.address,
+                    pair.remote.address,
+                    e
+                );
+            }
+        }
+    }
+
+    // Commit and signal this round's outcome (re-checks nomination state and
+    // the restart generation under the selection lock).
+    complete_controlling_nomination(inner, round_generation, nominated_pair, successful_pairs);
+}
+
+/// Event-driven post-nomination upgrade (controlling side). Called when a
+/// pair validates in a round that has ALREADY nominated, and the fresh pair
+/// strictly outranks the current selection: nominate the better pair
+/// (RFC 8445 §8.1.1 additional nomination) and commit the switch. The
+/// controlled peer verifies and follows. Spawned (never blocks the check
+/// list), serialized via `nomination_lock`, only-upgrade, aborted by ICE
+/// restarts.
+fn maybe_upgrade_on_success(inner: &Arc<IceTransportInner>, pair: &IceCandidatePair) {
+    let floor = inner
+        .selected_pair
+        .lock()
+        .as_ref()
+        .map(|p| p.priority(IceRole::Controlling));
+    let Some(floor) = floor else { return };
+    if pair.priority(IceRole::Controlling) <= floor {
+        return; // equal or lower: never downgrade or flap
+    }
+    let generation = inner
+        .nomination_generation
+        .load(core::sync::atomic::Ordering::SeqCst);
+    let rt_handle = inner.config.runtime_handle.clone();
+    let span = tracing::Span::current();
+    let inner = inner.clone();
+    let pair = pair.clone();
+    crate::spawn_rtc(
+        rt_handle.as_ref(),
+        span,
+        async move {
+            let _guard = inner.nomination_lock.lock().await;
+            if *inner.nomination_complete.borrow() != Some(true) {
+                return;
+            }
+            if inner
+                .nomination_generation
+                .load(core::sync::atomic::Ordering::SeqCst)
+                != generation
+            {
+                return; // ICE restart superseded this upgrade
+            }
+            let still_an_upgrade = inner
+                .selected_pair
+                .lock()
+                .as_ref()
+                .map(|cur| cur.priority(IceRole::Controlling) < pair.priority(IceRole::Controlling))
+                .unwrap_or(false);
+            if !still_an_upgrade {
+                return; // another upgrade already selected something at least as good
+            }
+            // The pair just validated with an ordinary check in this round;
+            // send the USE-CANDIDATE upgrade nomination and commit atomically.
+            match perform_binding_check(
+                &pair.local,
+                &pair.remote,
+                &inner,
+                IceRole::Controlling,
+                true,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let committed = {
+                        let _selection = inner.selection_lock.lock();
+                        commit_selected_pair(&inner, &pair, None)
+                    };
+                    if committed {
+                        info!(
+                            label = inner.config.label.as_deref().unwrap_or("-"),
+                            "ICE path upgrade (later-validated pair): selected pair -> {} {}",
+                            pair.local.address,
+                            pair.remote.address
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        },
+    );
 }
 
 /// Commit and signal the outcome of one controlling-side nomination round.
