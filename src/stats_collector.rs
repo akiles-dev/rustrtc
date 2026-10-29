@@ -146,11 +146,14 @@ impl LocalInboundStats {
         self.packets_received += 1;
 
         // RFC 3550 A.8 interarrival jitter (arrival in RTP timestamp units).
-        static START: crate::platform::sync::OnceLock<Instant> =
+        // The arrival time comes from `RttInstant`: on std the monotonic
+        // clock, not the platform `Instant`, which is whole milliseconds
+        // (8 units at 8 kHz, as much as the jitter of a good network).
+        static START: crate::platform::sync::OnceLock<RttInstant> =
             crate::platform::sync::OnceLock::new();
-        let start = START.get_or_init(Instant::now);
+        let start = START.get_or_init(RttInstant::now);
         let arrival_units =
-            (now.duration_since(*start).as_secs_f64() * self.clock_rate as f64) as u32;
+            arrival_units(RttInstant::now().duration_since(*start), self.clock_rate);
 
         if self.transit_init {
             self.jitter_q4 = jitter_step(
@@ -213,6 +216,14 @@ impl LocalInboundStats {
             delay_since_last_sender_report: delay_since_last_sr,
         }
     }
+}
+
+/// The arrival time in RTP timestamp units, modulo 2^32 like an RTP
+/// timestamp. A plain `as u32` saturates: after 2^32 units of process
+/// uptime (24.8 hours at 48 kHz) the arrival time stopped, and every packet
+/// interval counted as jitter.
+fn arrival_units(since_start: core::time::Duration, clock_rate: u32) -> u32 {
+    (since_start.as_secs_f64() * clock_rate as f64) as u64 as u32
 }
 
 /// One step of the RFC 3550 A.8 jitter estimate, J += (|D| - J) / 16, with
@@ -725,5 +736,12 @@ mod tests {
         let ts_delta = 100u32.wrapping_sub(u32::MAX - 859);
         assert_eq!(ts_delta, 960);
         assert_eq!(run_jitter([(960, ts_delta)]), 0);
+        // The arrival time wraps too: after 25 hours at 48 kHz it goes on,
+        // modulo 2^32, instead of stopping at u32::MAX.
+        let day = core::time::Duration::from_secs(25 * 3600);
+        let a = arrival_units(day, 48_000);
+        let b = arrival_units(day + core::time::Duration::from_millis(20), 48_000);
+        assert_ne!(a, u32::MAX);
+        assert_eq!(b.wrapping_sub(a), 960);
     }
 }
