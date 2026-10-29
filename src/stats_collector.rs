@@ -153,9 +153,11 @@ impl LocalInboundStats {
             (now.duration_since(*start).as_secs_f64() * self.clock_rate as f64) as u32;
 
         if self.transit_init {
-            let d = (arrival_units as i64 - self.last_arrival_rtp as i64)
-                - (rtp_ts as i64 - self.last_rtp_ts as i64);
-            self.jitter_q4 = jitter_step(self.jitter_q4, d);
+            self.jitter_q4 = jitter_step(
+                self.jitter_q4,
+                arrival_units.wrapping_sub(self.last_arrival_rtp),
+                rtp_ts.wrapping_sub(self.last_rtp_ts),
+            );
             self.jitter = self.jitter_q4 >> 4;
         } else {
             self.transit_init = true;
@@ -217,7 +219,12 @@ impl LocalInboundStats {
 /// J times 16 (`jitter_q4`) as in the RFC's fixed-point code. With J in
 /// whole units, the integer division dropped every change under 16 units
 /// (2 ms at 8 kHz): the estimate stayed at 0 on a good network.
-fn jitter_step(jitter_q4: u32, d: i64) -> u32 {
+///
+/// The two deltas are wrapping differences of the arrival times and of the
+/// RTP timestamps: an RTP timestamp starts at random, so it can wrap in any
+/// call, and a plain difference made one huge D there.
+fn jitter_step(jitter_q4: u32, arrival_delta: u32, rtp_ts_delta: u32) -> u32 {
+    let d = (arrival_delta as i32 as i64) - (rtp_ts_delta as i32 as i64);
     let j = jitter_q4 as i64;
     (j + d.abs() - ((j + 8) >> 4)).clamp(0, u32::MAX as i64) as u32
 }
@@ -695,7 +702,7 @@ mod tests {
     fn run_jitter(steps: impl IntoIterator<Item = (u32, u32)>) -> u32 {
         let mut q4 = 0;
         for (arrival, ts) in steps {
-            q4 = jitter_step(q4, arrival as i64 - ts as i64);
+            q4 = jitter_step(q4, arrival, ts);
         }
         q4 >> 4
     }
@@ -709,5 +716,14 @@ mod tests {
         assert_eq!(run_jitter(steps), 7);
         // Perfect pacing: no jitter.
         assert_eq!(run_jitter((0..500).map(|_| (160, 160))), 0);
+    }
+
+    #[test]
+    fn jitter_across_wraps() {
+        // The RTP timestamp wraps between two packets 960 units apart: the
+        // wrapping difference is 960, not -2^32 + 960.
+        let ts_delta = 100u32.wrapping_sub(u32::MAX - 859);
+        assert_eq!(ts_delta, 960);
+        assert_eq!(run_jitter([(960, ts_delta)]), 0);
     }
 }
