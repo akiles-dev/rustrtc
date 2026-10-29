@@ -795,6 +795,9 @@ struct PeerConnectionInner {
     rtp_observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
     rtp_media_ice_transports: Mutex<BTreeMap<u64, IceTransport>>,
     rtp_media_transports: Mutex<BTreeMap<u64, Arc<RtpTransport>>>,
+    /// SDES: the `a=crypto` (local, remote) that keyed the direct transport of
+    /// each m-line, by index (see `sdes_crypto`).
+    sdes_keys: Mutex<BTreeMap<usize, (crate::sdp::CryptoAttribute, crate::sdp::CryptoAttribute)>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     event_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
@@ -1027,6 +1030,7 @@ impl PeerConnection {
             rtp_observers: Mutex::new(Vec::new()),
             rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
             rtp_media_transports: Mutex::new(BTreeMap::new()),
+            sdes_keys: Mutex::new(BTreeMap::new()),
             sctp_transport: Mutex::new(None),
             data_channels: Arc::new(Mutex::new(Vec::new())),
             event_tx,
@@ -2967,7 +2971,7 @@ impl PeerConnection {
     /// m-line at `index` (see `sdes_crypto`). The primary transport uses the
     /// first m-line.
     fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>, index: usize) -> RtcResult<()> {
-        let (tx_keying, rx_keying, profile, mki) = {
+        let (tx_keying, rx_keying, profile, mki, keys) = {
             if let (Some(local), Some(remote)) = self.sdes_crypto(index) {
                 let profile = map_crypto_suite(&remote.crypto_suite)?;
                 if profile != map_crypto_suite(&local.crypto_suite)? {
@@ -3004,7 +3008,7 @@ impl PeerConnection {
                 // authentication on every packet we send.
                 let mki = negotiate_sdes_mki(&tx_params, &rx_params);
 
-                (tx_keying, rx_keying, profile, mki)
+                (tx_keying, rx_keying, profile, mki, (local, remote))
             } else {
                 return Err(RtcError::Internal(
                     "Missing crypto attributes for SDES".into(),
@@ -3026,6 +3030,7 @@ impl PeerConnection {
         }
 
         rtp_transport.start_srtp(session);
+        self.inner.sdes_keys.lock().insert(index, keys);
         Self::spawn_srtp_replay(rtp_transport);
         Ok(())
     }
@@ -3034,6 +3039,10 @@ impl PeerConnection {
     /// that are not keyed yet, each with its own m-line's `a=crypto`. Runs
     /// when a description is set: both descriptions are needed. The primary
     /// transport is keyed in `start_dtls`.
+    ///
+    /// A transport that has keys gets new ones when an offer/answer changes
+    /// them: a peer can send a new key in a re-INVITE, and it starts to use
+    /// a new key of ours when it gets our answer.
     fn setup_sdes_media_transports(&self) {
         if self.config().keying() != Keying::Sdes {
             return;
@@ -3044,6 +3053,28 @@ impl PeerConnection {
         if self.inner.local_description.lock().is_none() {
             return;
         }
+        // Until the answer, an offer's keys are not agreed.
+        let negotiated = *self.inner.signaling_state.borrow() == SignalingState::Stable;
+        let keys_changed = |index: usize| {
+            let (local, remote) = self.sdes_crypto(index);
+            let current = self.inner.sdes_keys.lock().get(&index).cloned();
+            match (local, remote, current) {
+                (Some(local), Some(remote), Some(current)) => (local, remote) != current,
+                _ => false,
+            }
+        };
+
+        let primary = self.inner.rtp_transport.lock().clone();
+        if let Some(primary) = primary
+            && primary.has_srtp()
+            && negotiated
+            && keys_changed(0)
+        {
+            if let Err(e) = self.setup_sdes(&primary, 0) {
+                warn!("SDES keying of m-line 0 failed: {}", e);
+            }
+        }
+
         for (transceiver, section_idx) in self.matched_rtp_media_sections(&remote) {
             let transport = self
                 .inner
@@ -3052,7 +3083,7 @@ impl PeerConnection {
                 .get(&transceiver.id())
                 .cloned();
             if let Some(transport) = transport
-                && !transport.has_srtp()
+                && (!transport.has_srtp() || (negotiated && keys_changed(section_idx)))
             {
                 if let Err(e) = self.setup_sdes(&transport, section_idx) {
                     warn!("SDES keying of m-line {} failed: {}", section_idx, e);
@@ -6010,7 +6041,22 @@ impl PeerConnectionInner {
                     }
                 }
 
-                let key_params = generate_sdes_key_params(map_crypto_suite(&suite)?);
+                // Later offers and answers keep our key for the same suite,
+                // as Linphone does: a new key makes the peer use it at once,
+                // so the SRTP sessions must start again on both sides.
+                let profile = map_crypto_suite(&suite)?;
+                let previous_key = self
+                    .local_description
+                    .lock()
+                    .as_ref()
+                    .and_then(|d| d.media_sections.get(media_index))
+                    .and_then(|m| {
+                        m.get_crypto_attributes()
+                            .into_iter()
+                            .find(|c| c.crypto_suite == suite)
+                    })
+                    .and_then(|c| c.key_params.split('|').next().map(str::to_string));
+                let key_params = previous_key.unwrap_or_else(|| generate_sdes_key_params(profile));
                 let crypto_val = format!("{tag} {suite} {key_params}{tail}");
                 section
                     .attributes
@@ -13986,6 +14032,83 @@ a=mid:0
                 .parse::<core::net::SocketAddr>()
                 .unwrap()
         );
+        pc.close();
+    }
+
+    /// A re-INVITE on an SDES leg: the answer keeps our key, and a new key
+    /// from the peer keys the transport again. Linphone sends a re-INVITE
+    /// when ICE completes and takes the key of our answer: a new key there,
+    /// with our sender still on the old one, made it drop all our audio.
+    #[tokio::test]
+    async fn srtp_mode_reinvite_keeps_our_key_and_takes_a_new_remote_key() {
+        use crate::TransportMode;
+        let offer = |version: u32, key: &str| {
+            let sdp = format!(
+                "v=0\r\n\
+                 o=- 1 {version} IN IP4 127.0.0.1\r\n\
+                 s=-\r\n\
+                 c=IN IP4 127.0.0.1\r\n\
+                 t=0 0\r\n\
+                 m=audio 4000 RTP/SAVP 0\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{key}\r\n\
+                 a=sendrecv\r\n"
+            );
+            SessionDescription::parse(SdpType::Offer, &sdp).unwrap()
+        };
+        let our_key = |answer: &SessionDescription| {
+            answer.media_sections[0].get_crypto_attributes()[0]
+                .key_params
+                .clone()
+        };
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+
+        let first_key = "a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK";
+        pc.set_remote_description(offer(1, first_key))
+            .await
+            .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        let key = our_key(&answer);
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let primary = pc.inner.rtp_transport.lock().clone().unwrap();
+        for _ in 0..100 {
+            if primary.has_srtp() {
+                break;
+            }
+            crate::platform::task::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        assert!(primary.has_srtp(), "audio transport keyed");
+
+        // Linphone's re-INVITE: its own key again.
+        pc.set_remote_description(offer(2, first_key))
+            .await
+            .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        assert_eq!(
+            our_key(&answer),
+            key,
+            "our key changed in the re-INVITE answer"
+        );
+
+        // A peer that sends a new key.
+        let new_key = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNk";
+        pc.set_remote_description(offer(3, new_key)).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        assert_eq!(our_key(&answer), key);
+        let (local, remote) = pc.inner.sdes_keys.lock().get(&0).cloned().unwrap();
+        assert_eq!(
+            remote.key_params,
+            format!("inline:{new_key}"),
+            "not keyed again"
+        );
+        assert_eq!(local.key_params, key);
         pc.close();
     }
 
