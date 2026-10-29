@@ -24,7 +24,9 @@ pub use upnp::{
     UpnpPortMapper,
 };
 
-use crate::config::{BufferDropStrategy, IceServer, IceTransportPolicy, RtcConfiguration};
+use crate::config::{
+    BufferDropStrategy, Connectivity, IceServer, IceTransportPolicy, RtcConfiguration,
+};
 use crate::platform::atomic64::AtomicU64;
 use crate::prelude::*;
 use crate::transports::ice::turn::{TurnClient, TurnCredentials};
@@ -1075,7 +1077,7 @@ impl IceTransportRunner {
             || state == IceTransportState::Disconnected
             || state == IceTransportState::Completed
         {
-            if inner.config.transport_mode == crate::TransportMode::WebRtc {
+            if inner.config.connectivity() == Connectivity::Ice {
                 let last_nanos = inner.last_received_nanos.load(Ordering::Relaxed);
                 let now_nanos = inner.created_at.elapsed().as_nanos() as u64;
                 let elapsed = Duration::from_nanos(now_nanos.saturating_sub(last_nanos));
@@ -1147,7 +1149,7 @@ impl IceTransportRunner {
                             let _ = socket.send_to(&bytes, pair.remote.address).await;
                             return Some(cleanup);
                         }
-                    } else if inner.config.transport_mode != crate::TransportMode::WebRtc
+                    } else if inner.config.connectivity().is_direct()
                         && let Ok(bytes) = msg.encode(None, false)
                     {
                         let _ = socket.send_to(&bytes, pair.remote.address).await;
@@ -3750,7 +3752,7 @@ async fn handle_stun_request(
     // nominated pair: retargeting it onto an address the peer never nominated
     // blackholes media while consent keepalives still flow on the original
     // socket.
-    if inner.config.enable_latching && inner.config.transport_mode != crate::TransportMode::WebRtc {
+    if inner.config.enable_latching && inner.config.connectivity().is_direct() {
         // Decide AND commit under the lock: reading the current pair before
         // taking it would race a concurrent selection commit (e.g.
         // USE-CANDIDATE) and let a latching pair derived from the stale
@@ -5023,7 +5025,7 @@ impl IceGatherer {
     fn external_srflx_ip(&self, bind_ip: IpAddr) -> Option<IpAddr> {
         if self.config.external_ip_candidate_type
             != crate::config::ExternalIpCandidateType::ServerReflexive
-            || self.config.transport_mode != crate::config::TransportMode::WebRtc
+            || self.config.connectivity() != Connectivity::Ice
             || self.config.ice_transport_policy != IceTransportPolicy::All
             || bind_ip.is_loopback()
         {
@@ -5508,8 +5510,8 @@ impl IceGatherer {
             if let Ok(ip) = bind_ip_str.parse::<IpAddr>() {
                 bind_ips.push(ip);
             }
-        } else if self.config.transport_mode != crate::TransportMode::WebRtc {
-            // Non-WebRTC mode: prefer a LAN IP if available.
+        } else if self.config.connectivity().is_direct() {
+            // A direct transport: prefer a LAN IP if available.
             // Binding to 0.0.0.0 on macOS can lead to "No route to host" (os error 65)
             // if the destination is on a LAN segment but the OS picks a wrong default interface.
             if let Ok(ip) = get_local_ip() {

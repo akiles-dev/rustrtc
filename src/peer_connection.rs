@@ -1,3 +1,4 @@
+use crate::config::{Connectivity, Keying};
 use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
@@ -47,7 +48,7 @@ use crate::transports::sctp::{DataChannel, DataChannelConfig, SctpLinkStats, Sct
 use crate::transports::sctp::{DataChannel, SctpTransport};
 #[cfg(feature = "std")]
 use crate::transports::udptl::UdtlTransport;
-use crate::{AudioCapability, RtcConfiguration, TransportMode, VideoCapability};
+use crate::{AudioCapability, RtcConfiguration, VideoCapability};
 use alloc::collections::VecDeque;
 use async_trait::async_trait;
 use base64::prelude::*;
@@ -954,14 +955,11 @@ pub(crate) fn negotiate_sdes_mki(
 
 impl PeerConnection {
     pub fn new(config: RtcConfiguration) -> Self {
-        let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
-        // SDES-SRTP uses a direct transport like RTP (c-line address + a=crypto),
-        // NOT full ICE — so it uses the same direct loop as RTP mode.
-        let is_direct_mode = is_rtp_mode || config.transport_mode == TransportMode::Srtp;
+        let is_direct = config.connectivity().is_direct();
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
-        // Only WebRtc/Srtp modes use DTLS. Skip the expensive EC keypair
-        // generation + PEM round-trip for plain RTP mode.
-        let (certificate, dtls_fingerprint) = if is_rtp_mode {
+        // Only DTLS keying needs a certificate. Skip the expensive EC keypair
+        // generation + PEM round-trip for plain RTP and SDES-SRTP.
+        let (certificate, dtls_fingerprint) = if config.keying() != Keying::Dtls {
             (Arc::new(dtls::Certificate::default()), String::new())
         } else if let Some(cert) = config.dtls_certificate.clone() {
             // Pre-provisioned DER certificate (the embedded path: no
@@ -1056,8 +1054,8 @@ impl PeerConnection {
             inner: Arc::new(inner),
         };
 
-        if is_direct_mode {
-            // RTP / SDES-SRTP: skip ICE gathering/connectivity/DTLS loops.
+        if is_direct {
+            // Direct transports (RTP, SDES-SRTP): skip ICE gathering/connectivity/DTLS loops.
             // Only run the ice_runner for socket read loops (needed to receive packets).
             // The ICE state machine and DTLS/SRTP setup are handled directly via
             // setup_direct_rtp / complete_direct_rtp.
@@ -1405,8 +1403,7 @@ impl PeerConnection {
         if nack_enabled {
             builder = builder.nack();
         }
-        if self.inner.config.enable_gcc && self.inner.config.transport_mode == TransportMode::WebRtc
-        {
+        if self.inner.config.enable_gcc && self.inner.config.keying() == Keying::Dtls {
             builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
         }
         let receiver = builder.build();
@@ -1425,13 +1422,13 @@ impl PeerConnection {
         self.inner.transceivers.lock().push(transceiver.clone());
 
         // If the transport is already up (renegotiation), record it so a sender
-        // installed later via set_sender is connected. Direct RTP records it
-        // once the remote description selects the media transport. Image
+        // installed later via set_sender is connected. A direct transport records
+        // it once the remote description selects the media transport. Image
         // transceivers send over their own UDPTL transport, but the transport
         // -up path records the RTP reference for them too, so creation order
         // does not change what a transceiver carries.
         if matches!(kind, MediaKind::Audio | MediaKind::Video | MediaKind::Image)
-            && self.inner.config.transport_mode != TransportMode::Rtp
+            && !self.inner.config.connectivity().is_direct()
             && let Some(transport) = self.inner.rtp_transport.lock().as_ref()
         {
             transceiver.set_rtp_transport(Arc::downgrade(transport));
@@ -1531,7 +1528,7 @@ impl PeerConnection {
         *transceiver.sender_track_id.lock() = Some(sender.track_id().to_string());
 
         // If transport is already established, attach the new transceiver
-        // immediately. In direct RTP mode, only attach to an explicit media
+        // immediately. With a direct transport, only attach to an explicit media
         // transport; falling back to the primary transport would put a newly
         // added non-BUNDLE video sender on the audio socket until SDP setup
         // catches up.
@@ -1542,7 +1539,7 @@ impl PeerConnection {
             .get(&transceiver.id())
             .cloned()
             .or_else(|| {
-                if self.inner.config.transport_mode == TransportMode::Rtp {
+                if self.inner.config.connectivity().is_direct() {
                     None
                 } else {
                     self.inner.rtp_transport.lock().clone()
@@ -1583,7 +1580,7 @@ impl PeerConnection {
             .inner
             .build_description(SdpType::Offer, |dir| dir)
             .await?;
-        if self.inner.config.transport_mode == TransportMode::Rtp && !Self::sdp_has_bundle(&desc) {
+        if self.inner.config.connectivity().is_direct() && !Self::sdp_has_bundle(&desc) {
             for (media_index, (transceiver, _)) in self
                 .matched_rtp_media_sections(&desc)
                 .into_iter()
@@ -1742,6 +1739,7 @@ impl PeerConnection {
         if applies_answer {
             self.apply_negotiated_send_directions();
         }
+        self.setup_sdes_media_transports();
         Ok(())
     }
 
@@ -1826,7 +1824,7 @@ impl PeerConnection {
 
     async fn apply_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
-        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc {
+        let remote_dtls_fingerprint = if self.config().keying() == Keying::Dtls {
             match desc.dtls_fingerprint() {
                 Ok(Some(fingerprint)) if fingerprint.algorithm == "sha-256" => {
                     Some(fingerprint.value)
@@ -1941,9 +1939,8 @@ impl PeerConnection {
             let current_role = *self.inner.dtls_role.borrow();
             if current_role.is_none() {
                 let mut new_role = None;
-                if self.config().transport_mode == TransportMode::Rtp
-                    || self.config().transport_mode == TransportMode::Srtp
-                {
+                if self.config().keying() != Keying::Dtls {
+                    // No DTLS handshake: the role only wakes the transport start.
                     new_role = Some(true);
                 } else {
                     for section in &desc.media_sections {
@@ -2004,7 +2001,6 @@ impl PeerConnection {
         let mut ufrag = None;
         let mut pwd = None;
         let mut candidates = Vec::new();
-        let mut remote_addr = None;
 
         // Check session-level attributes for ICE credentials
         for attr in &desc.session.attributes {
@@ -2016,23 +2012,6 @@ impl PeerConnection {
         }
 
         for section in &desc.media_sections {
-            if self.config().transport_mode != TransportMode::WebRtc {
-                let conn_opt = section
-                    .connection
-                    .as_ref()
-                    .or(desc.session.connection.as_ref());
-                if let Some(conn) = conn_opt {
-                    let parts: Vec<&str> = conn.split_whitespace().collect();
-                    if parts.len() >= 3
-                        && parts[0] == "IN"
-                        && parts[1] == "IP4"
-                        && let Ok(ip) = parts[2].parse::<core::net::IpAddr>()
-                    {
-                        remote_addr = Some(core::net::SocketAddr::new(ip, section.port));
-                    }
-                }
-            }
-
             for attr in &section.attributes {
                 if attr.key == "ice-ufrag" {
                     ufrag = attr.value.clone();
@@ -2047,7 +2026,7 @@ impl PeerConnection {
             }
         }
 
-        if self.config().transport_mode == TransportMode::WebRtc {
+        if self.config().connectivity() == Connectivity::Ice {
             if let (Some(u), Some(p)) = (ufrag.clone(), pwd.clone()) {
                 let params = crate::transports::ice::IceParameters {
                     username_fragment: u,
@@ -2066,17 +2045,10 @@ impl PeerConnection {
                     self.inner.ice_transport.add_remote_candidate(candidate);
                 }
             }
-        } else if self.config().transport_mode == TransportMode::Rtp {
-            // Direct RTP setup is deferred until media sections have been matched
-            // to transceivers. Non-BUNDLE audio/video need separate sockets.
-        } else if let Some(addr) = remote_addr {
-            // SRTP mode: use ICE start_direct
-            self.inner
-                .ice_transport
-                .start_direct(addr)
-                .await
-                .map_err(|e| crate::RtcError::Internal(format!("ICE direct error: {}", e)))?;
         }
+        // A direct transport (RTP, SDES-SRTP) is set up below, once the media
+        // sections are matched to transceivers: non-BUNDLE audio/video need
+        // separate sockets.
 
         // Create transceivers for new media sections in Offer
         if desc.sdp_type == SdpType::Offer {
@@ -2301,9 +2273,7 @@ impl PeerConnection {
                     } else {
                         debug!("NACK: disabled for new receiver mid={}", mid);
                     }
-                    if self.inner.config.enable_gcc
-                        && self.inner.config.transport_mode == TransportMode::WebRtc
-                    {
+                    if self.inner.config.enable_gcc && self.inner.config.keying() == Keying::Dtls {
                         builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
                     }
                     let receiver = builder.build();
@@ -2315,9 +2285,9 @@ impl PeerConnection {
                     }
 
                     // If transport is already active (renegotiation), attach it to the new receiver.
-                    // Direct RTP attaches after media sections are matched so non-BUNDLE video
-                    // does not briefly register on the primary audio transport.
-                    if self.inner.config.transport_mode != TransportMode::Rtp {
+                    // A direct transport attaches after media sections are matched so
+                    // non-BUNDLE video does not briefly register on the primary audio transport.
+                    if !self.inner.config.connectivity().is_direct() {
                         let transport_guard = self.inner.rtp_transport.lock();
                         if let Some(transport) = &*transport_guard {
                             // Record it on the transceiver too, so a sender
@@ -2450,9 +2420,10 @@ impl PeerConnection {
             let _ = self.inner.dtls_role.send(Some(r));
         }
 
-        if self.config().transport_mode == TransportMode::Rtp {
+        if self.config().connectivity().is_direct() {
             self.configure_rtp_media_transports_from_remote(&desc, ufrag, pwd, candidates)
                 .await?;
+            self.setup_sdes_media_transports();
         }
 
         // Refresh mux/RTCP routing after any remote description change.
@@ -2590,14 +2561,11 @@ impl PeerConnection {
             self.config().label.clone(),
             self.config().probation_max_packets,
         );
-        // Symmetric-RTP latching: SDES legs are direct UDP like plain RTP, so
-        // a NAT'd peer whose SDP advertises a private `c=` still needs egress
-        // to follow its observed packet source. SRTP packets keep the clear
-        // RTP header, so the latch's header inspection is compatible.
-        if (self.config().transport_mode == TransportMode::Rtp
-            || self.config().transport_mode == TransportMode::Srtp)
-            && self.config().enable_latching
-        {
+        // Symmetric-RTP latching on a direct transport: a NAT'd peer whose SDP
+        // advertises a private `c=` still needs egress to follow its observed
+        // packet source. SRTP packets keep the clear RTP header, so the
+        // latch's header inspection works for SDES too.
+        if self.config().connectivity().is_direct() && self.config().enable_latching {
             self.inner.pc_span.in_scope(|| {
                 debug!("start_dtls: enabling symmetric-RTP latch (direct mode)");
             });
@@ -2610,7 +2578,7 @@ impl PeerConnection {
         let mut pair_rx = self.inner.ice_transport.subscribe_selected_pair();
         let ice_conn_monitor = ice_conn.clone();
 
-        if self.config().transport_mode != TransportMode::WebRtc {
+        if self.config().connectivity().is_direct() {
             let rtcp_addr = {
                 let remote_desc = self.inner.remote_description.lock();
                 if let Some(desc) = &*remote_desc {
@@ -2626,7 +2594,7 @@ impl PeerConnection {
             }
         }
 
-        let srtp_required = self.config().transport_mode != TransportMode::Rtp;
+        let srtp_required = self.config().keying() != Keying::None;
         let allow_ssrc_change = self.config().enable_latching;
         let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
             ice_conn.clone(),
@@ -2661,36 +2629,23 @@ impl PeerConnection {
             }
         }
 
-        if self.config().transport_mode == TransportMode::Srtp {
+        if self.config().connectivity().is_direct() {
             self.inner
                 .ice_transport
                 .set_data_receiver(ice_conn.clone())
                 .await;
-            // The direct transport can reach "connected" the moment its
-            // socket binds — on the ANSWERER side that may be before the
-            // local answer exists, so `setup_sdes` would fail with "Missing
-            // crypto attributes" and leave the leg permanently without SRTP
-            // (rustpbx issue #281 e2e flake). Wait for the negotiation to
-            // complete instead of failing the transport start.
-            Self::wait_for_sdes_attributes(&self.inner, core::time::Duration::from_secs(10))
-                .await?;
-            self.setup_sdes(&rtp_transport)?;
-            let rtcp_loop = Self::create_rtcp_loop(
-                rtp_transport.clone(),
-                Arc::downgrade(&self.inner),
-                self.inner.stats_collector.clone(),
-            );
-            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-            return Ok(
-                self.spawn_transport_loops(vec![Box::pin(rtcp_loop), Box::pin(pair_monitor)])
-            );
-        }
-
-        if self.config().transport_mode == TransportMode::Rtp {
-            self.inner
-                .ice_transport
-                .set_data_receiver(ice_conn.clone())
-                .await;
+            if self.config().keying() == Keying::Sdes {
+                // The direct transport can reach "connected" the moment its
+                // socket binds — on the ANSWERER side that may be before the
+                // local answer exists, so `setup_sdes` would fail with "Missing
+                // crypto attributes" and leave the leg permanently without SRTP
+                // (rustpbx issue #281 e2e flake). Wait for the negotiation to
+                // complete instead of failing the transport start.
+                Self::wait_for_sdes_attributes(&self.inner, core::time::Duration::from_secs(10))
+                    .await?;
+                // The primary transport: the keys of the first m-line.
+                self.setup_sdes(&rtp_transport, 0)?;
+            }
             let rtcp_loop = Self::create_rtcp_loop(
                 rtp_transport.clone(),
                 Arc::downgrade(&self.inner),
@@ -2714,8 +2669,8 @@ impl PeerConnection {
             );
         }
 
-        // ── WebRtc (DTLS/SRTP) transport path. ──
-        // The rtp and srtp transport modes returned above.
+        // ── Full ICE + DTLS-SRTP (WebRTC) transport path. ──
+        // Direct transports returned above.
         {
             #[cfg(not(feature = "std"))]
             if self.inner.certificate.certificate.is_empty() {
@@ -2987,22 +2942,33 @@ impl PeerConnection {
         }
     }
 
-    fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>) -> RtcResult<()> {
+    /// The `a=crypto` (local, remote) of the m-line at `index` in both
+    /// descriptions. By index, not mid: an answer has the offer's m-lines in
+    /// the same order (RFC 3264 §6), and legacy SIP SDP has no a=mid.
+    fn sdes_crypto(
+        &self,
+        index: usize,
+    ) -> (
+        Option<crate::sdp::CryptoAttribute>,
+        Option<crate::sdp::CryptoAttribute>,
+    ) {
+        let crypto = |d: &Option<SessionDescription>| {
+            d.as_ref()
+                .and_then(|d| d.media_sections.get(index))
+                .and_then(|m| m.get_crypto_attributes().into_iter().next())
+        };
+        (
+            crypto(&self.inner.local_description.lock()),
+            crypto(&self.inner.remote_description.lock()),
+        )
+    }
+
+    /// Key `rtp_transport` with SDES (RFC 4568), with the `a=crypto` of the
+    /// m-line at `index` (see `sdes_crypto`). The primary transport uses the
+    /// first m-line.
+    fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>, index: usize) -> RtcResult<()> {
         let (tx_keying, rx_keying, profile, mki) = {
-            let remote_desc = self.inner.remote_description.lock();
-            let local_desc = self.inner.local_description.lock();
-
-            let remote_crypto = remote_desc
-                .as_ref()
-                .and_then(|d| d.media_sections.first())
-                .and_then(|m| m.get_crypto_attributes().into_iter().next());
-
-            let local_crypto = local_desc
-                .as_ref()
-                .and_then(|d| d.media_sections.first())
-                .and_then(|m| m.get_crypto_attributes().into_iter().next());
-
-            if let (Some(remote), Some(local)) = (remote_crypto, local_crypto) {
+            if let (Some(local), Some(remote)) = self.sdes_crypto(index) {
                 let profile = map_crypto_suite(&remote.crypto_suite)?;
                 if profile != map_crypto_suite(&local.crypto_suite)? {
                     return Err(RtcError::Internal("Crypto suite mismatch".into()));
@@ -3061,33 +3027,38 @@ impl PeerConnection {
 
         rtp_transport.start_srtp(session);
         Self::spawn_srtp_replay(rtp_transport);
+        Ok(())
+    }
 
-        let transceivers = self.inner.transceivers.lock();
-        for t in transceivers.iter() {
-            let sender_arc = t.sender.lock().clone();
-            let receiver_arc = t.receiver.lock().clone();
-
-            if let Some(sender) = &sender_arc {
-                sender.set_transport(rtp_transport.clone());
-            }
-
-            if let Some(receiver) = &receiver_arc {
-                receiver.set_transport(
-                    rtp_transport.clone(),
-                    Some(self.inner.event_tx.clone()),
-                    Some(Arc::downgrade(t)),
-                );
-                if let Some(sender) = &sender_arc {
-                    receiver.set_feedback_ssrc(sender.ssrc());
+    /// SDES: key the per-m-line direct transports (non-BUNDLE video, ...)
+    /// that are not keyed yet, each with its own m-line's `a=crypto`. Runs
+    /// when a description is set: both descriptions are needed. The primary
+    /// transport is keyed in `start_dtls`.
+    fn setup_sdes_media_transports(&self) {
+        if self.config().keying() != Keying::Sdes {
+            return;
+        }
+        let Some(remote) = self.inner.remote_description.lock().clone() else {
+            return;
+        };
+        if self.inner.local_description.lock().is_none() {
+            return;
+        }
+        for (transceiver, section_idx) in self.matched_rtp_media_sections(&remote) {
+            let transport = self
+                .inner
+                .rtp_media_transports
+                .lock()
+                .get(&transceiver.id())
+                .cloned();
+            if let Some(transport) = transport
+                && !transport.has_srtp()
+            {
+                if let Err(e) = self.setup_sdes(&transport, section_idx) {
+                    warn!("SDES keying of m-line {} failed: {}", section_idx, e);
                 }
             }
         }
-        drop(transceivers);
-
-        *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
-        self.attach_registered_observers(&rtp_transport);
-        self.sync_transport_send_gates();
-        Ok(())
     }
 
     /// Kicks a one-shot replay of RTP buffered before DTLS/SRTP completed.
@@ -3394,7 +3365,7 @@ impl PeerConnection {
             .inner
             .direct_rtp_ice_transport(transceiver.id(), primary);
 
-        if self.config().enable_ice_lite {
+        if self.config().connectivity() == Connectivity::IceLite {
             if let (Some(u), Some(p)) = (ufrag, pwd) {
                 let params = crate::transports::ice::IceParameters {
                     username_fragment: u.clone(),
@@ -3509,7 +3480,7 @@ impl PeerConnection {
 
         let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
             ice_conn.clone(),
-            false,
+            self.config().keying() != Keying::None,
             self.config().enable_latching,
         ));
         ice_conn.set_rtp_receiver(rtp_transport.clone());
@@ -4116,10 +4087,8 @@ impl PeerConnection {
     }
 
     pub async fn wait_for_gathering_complete(&self) {
-        if self.config().transport_mode == TransportMode::Rtp
-            || self.config().transport_mode == TransportMode::Srtp
-        {
-            // RTP / SDES-SRTP: no ICE gathering needed. Gathering completes
+        if self.config().connectivity().is_direct() {
+            // Direct transport: no ICE gathering needed. Gathering completes
             // synchronously when setup_direct_rtp_offer is called.
             return;
         }
@@ -4154,7 +4123,7 @@ impl PeerConnection {
     /// ice-ufrag/ice-pwd). The peer detects the credential change and restarts
     /// its own side.
     pub async fn restart_ice(&self) -> RtcResult<()> {
-        if self.config().transport_mode != TransportMode::WebRtc {
+        if self.config().connectivity() != Connectivity::Ice {
             return Err(RtcError::InvalidState(
                 "restart_ice only applies to WebRtc transport mode".into(),
             ));
@@ -4252,37 +4221,9 @@ impl PeerConnection {
             }
         }
 
-        if self.config().transport_mode != TransportMode::WebRtc {
-            if let Some(section) = new_desc.media_sections.first() {
-                let conn_opt = section
-                    .connection
-                    .as_ref()
-                    .or(new_desc.session.connection.as_ref());
-                if let Some(conn) = conn_opt {
-                    let parts: Vec<&str> = conn.split_whitespace().collect();
-                    if parts.len() >= 3
-                        && parts[0] == "IN"
-                        && parts[1] == "IP4"
-                        && let Ok(ip) = parts[2].parse::<core::net::IpAddr>()
-                    {
-                        let remote_addr = core::net::SocketAddr::new(ip, section.port);
-                        if self.config().transport_mode == TransportMode::Rtp {
-                            self.inner.ice_transport.complete_direct_rtp(remote_addr);
-                            debug!("Updated RTP remote address to {}", remote_addr);
-                        } else if self.config().transport_mode == TransportMode::Srtp
-                            && let Some(transport) = self.inner.rtp_transport.lock().as_ref()
-                        {
-                            transport.ice_conn().set_remote_addr_from_signaling(
-                                remote_addr,
-                                "SRTP remote from SDP",
-                            );
-                            debug!("Updated SRTP remote address to {}", remote_addr);
-                        }
-                    }
-                }
-            }
-            self.update_rtcp_mux_from_remote();
-        }
+        // A direct transport's remote address and RTCP routing follow the new
+        // description in apply_remote_description, after this returns
+        // (configure_rtp_media_transports_from_remote, update_rtcp_mux_from_remote).
 
         // Update remote description
         *self.inner.remote_description.lock() = Some(new_desc.clone());
@@ -4583,7 +4524,7 @@ fn update_local_description_on_gather(
     inner: &PeerConnectionInner,
     ice_transport: &IceTransport,
 ) -> bool {
-    if inner.config.transport_mode == TransportMode::WebRtc {
+    if inner.config.connectivity() == Connectivity::Ice {
         let candidates = ice_transport.local_candidates();
         let candidate_strs: Vec<String> = candidates.iter().map(|c| c.to_sdp()).collect();
         let mut local_guard = inner.local_description.lock();
@@ -4688,7 +4629,7 @@ async fn run_gathering_loop(
             }
             crate::platform::select::Which3::C(_) => {
                 if let Some(inner) = inner_weak.upgrade()
-                    && inner.config.transport_mode == TransportMode::WebRtc
+                    && inner.config.connectivity() == Connectivity::Ice
                 {
                     let strs: Vec<String> = ice_transport
                         .local_candidates()
@@ -4881,14 +4822,14 @@ async fn run_ice_dtls_loop(
                     continue;
                 }
 
-                // For RTP/SRTP mode, we don't need DTLS role to start
-                let transport_mode = if let Some(inner) = inner_weak.upgrade() {
-                    inner.config.transport_mode.clone()
+                // Without DTLS keying, we don't need DTLS role to start
+                let keying = if let Some(inner) = inner_weak.upgrade() {
+                    inner.config.keying()
                 } else {
                     return;
                 };
 
-                if transport_mode != TransportMode::WebRtc {
+                if keying != Keying::Dtls {
                     if !handle_connected_state_no_dtls(&inner_weak, &mut ice_state_rx).await {
                         return;
                     }
@@ -5638,7 +5579,8 @@ impl PeerConnectionInner {
                 .collect()
         };
 
-        let mode = self.config.transport_mode.clone();
+        let connectivity = self.config.connectivity();
+        let keying = self.config.keying();
         // BUNDLE (RFC 8843): a group may contain a single m-section.  When we
         // are answering an offer that already established a BUNDLE group we
         // MUST echo it back -- even with only one media section -- otherwise
@@ -5649,7 +5591,9 @@ impl PeerConnectionInner {
         let will_bundle = self.config.sdp_compatibility
             != crate::config::SdpCompatibilityMode::LegacySip
             && match sdp_type {
-                SdpType::Offer => ordered_transceivers.len() > 1 || mode == TransportMode::WebRtc,
+                SdpType::Offer => {
+                    ordered_transceivers.len() > 1 || connectivity == Connectivity::Ice
+                }
                 SdpType::Answer => remote_offered_bundle,
                 _ => false,
             };
@@ -5657,30 +5601,12 @@ impl PeerConnectionInner {
             == crate::config::RtcpMuxPolicy::Require
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
 
-        if mode != TransportMode::Rtp {
+        // Full ICE gathers; a direct transport binds its socket per m-line
+        // below (setup_direct_rtp_offer).
+        if connectivity == Connectivity::Ice {
             self.ice_transport
                 .start_gathering()
                 .map_err(|err| RtcError::InvalidState(format!("ICE gathering failed: {err}")))?;
-        }
-
-        // For non-WebRTC (SRTP), wait for at least one candidate if none are available.
-        // RTP mode already has candidates from setup_direct_rtp_offer above.
-        if mode == TransportMode::Srtp {
-            let mut candidates = self.ice_transport.local_candidates();
-            if candidates.is_empty() {
-                let mut rx = self.ice_transport.subscribe_candidates();
-                let start = crate::platform::time::Instant::now();
-                let timeout_dur = core::time::Duration::from_millis(500);
-
-                while candidates.is_empty() && start.elapsed() < timeout_dur {
-                    let _ = crate::platform::time::with_timeout(
-                        timeout_dur.saturating_sub(start.elapsed()),
-                        rx.recv(),
-                    )
-                    .await;
-                    candidates = self.ice_transport.local_candidates();
-                }
-            }
         }
 
         let ice_params = self.ice_transport.local_parameters();
@@ -5719,16 +5645,14 @@ impl PeerConnectionInner {
             .attributes
             .iter()
             .any(|attr| attr.key == "msid-semantic")
-            && self.config.transport_mode == TransportMode::WebRtc
+            && keying == Keying::Dtls
         {
             desc.session
                 .attributes
                 .push(Attribute::new("msid-semantic", Some("WMS *".into())));
         }
 
-        let mode = self.config.transport_mode.clone();
-
-        if (mode == TransportMode::Rtp || mode == TransportMode::Srtp)
+        if connectivity.is_direct()
             && let Some(ext_ip) = &self.config.external_ip
         {
             desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
@@ -5808,10 +5732,10 @@ impl PeerConnectionInner {
                 // UDP/TLS/RTP/SAVPF; SDES-SRTP must advertise RTP/SAVP so that
                 // non-ICE/non-DTLS peers (e.g. SIP trunks, Twilio) accept the
                 // offer/answer, while plain RTP uses RTP/AVP.
-                match mode {
-                    TransportMode::Rtp => section.protocol = "RTP/AVP".to_string(),
-                    TransportMode::Srtp => section.protocol = "RTP/SAVP".to_string(),
-                    TransportMode::WebRtc => {}
+                match keying {
+                    Keying::None => section.protocol = "RTP/AVP".to_string(),
+                    Keying::Sdes => section.protocol = "RTP/SAVP".to_string(),
+                    Keying::Dtls => {}
                 }
             }
 
@@ -5821,9 +5745,7 @@ impl PeerConnectionInner {
             // the whole if/else-if chain under no_std, leaving offer m=/c=
             // lines as placeholders (port 9, no connection line) and making
             // the Srtp/Rtp delivery surface unable to connect.
-            if transceiver.kind() == MediaKind::Image
-                && (mode == TransportMode::Rtp || mode == TransportMode::Srtp)
-            {
+            if transceiver.kind() == MediaKind::Image && connectivity.is_direct() {
                 #[cfg(not(feature = "std"))]
                 {
                     // T.38/UDPTL is a std-only delivery surface (D6).
@@ -5867,7 +5789,7 @@ impl PeerConnectionInner {
                         .unwrap_or_else(|| "127.0.0.1".to_string());
                     section.connection = Some(format!("IN IP4 {}", ip));
                 }
-            } else if mode == TransportMode::WebRtc {
+            } else if connectivity == Connectivity::Ice {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
                 section
                     .attributes
@@ -5896,35 +5818,28 @@ impl PeerConnectionInner {
                         .push(Attribute::new("end-of-candidates", None));
                 }
             } else {
-                // For RTP/SRTP, use the first candidate's address for c= and m= port
-                // Prefer non-loopback candidates. SDES-SRTP (TransportMode::Srtp)
-                // also uses a direct transport like RTP — it does NOT run ICE.
-                let section_ice_transport =
-                    if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
-                        let ice_transport = if !will_bundle && media_index > 0 {
-                            self.direct_rtp_ice_transport(transceiver.id(), false)
-                        } else {
-                            self.ice_transport.clone()
-                        };
-                        let needs_rtcp = match sdp_type {
-                            SdpType::Answer => !remote_offered_rtcp_mux,
-                            _ => !local_offers_rtcp_mux,
-                        };
-                        if ice_transport.local_candidates().is_empty() {
-                            ice_transport
-                                .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
-                                .await
-                                .map_err(|err| {
-                                    RtcError::Internal(format!("RTP socket bind failed: {err}"))
-                                })?;
-                        }
-                        // RTP mode skips the ICE gathering loop; section-driven direct socket
-                        // setup publishes candidates synchronously.
-                        let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
-                        ice_transport
-                    } else {
-                        self.ice_transport.clone()
-                    };
+                // A direct transport (RTP, SDES-SRTP): use the first candidate's
+                // address for c= and m= port. Prefer non-loopback candidates.
+                let section_ice_transport = if !will_bundle && media_index > 0 {
+                    self.direct_rtp_ice_transport(transceiver.id(), false)
+                } else {
+                    self.ice_transport.clone()
+                };
+                let needs_rtcp = match sdp_type {
+                    SdpType::Answer => !remote_offered_rtcp_mux,
+                    _ => !local_offers_rtcp_mux,
+                };
+                if section_ice_transport.local_candidates().is_empty() {
+                    section_ice_transport
+                        .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
+                        .await
+                        .map_err(|err| {
+                            RtcError::Internal(format!("RTP socket bind failed: {err}"))
+                        })?;
+                }
+                // A direct transport skips the ICE gathering loop; section-driven
+                // direct socket setup publishes candidates synchronously.
+                let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
                 let candidates = section_ice_transport.local_candidates();
                 local_rtcp_addr = section_ice_transport.local_rtcp_addr();
                 if let Some(cand) = candidates
@@ -5943,9 +5858,9 @@ impl PeerConnectionInner {
                     }
                 }
 
-                // ICE-lite in RTP mode: include ICE attributes so remote full-ICE
-                // agents can perform connectivity checks against us.
-                if mode == TransportMode::Rtp && self.config.enable_ice_lite {
+                // ICE-lite: include ICE attributes so remote full-ICE agents can
+                // perform connectivity checks against us.
+                if connectivity == Connectivity::IceLite {
                     if !desc.session.attributes.iter().any(|a| a.key == "ice-lite") {
                         desc.session
                             .attributes
@@ -5983,7 +5898,7 @@ impl PeerConnectionInner {
             if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
                 section.attributes.retain(|attr| attr.key != "rtcp-mux");
             }
-            if mode == TransportMode::Rtp
+            if connectivity.is_direct()
                 && !section.attributes.iter().any(|attr| attr.key == "rtcp-mux")
                 && let Some(rtcp_addr) = local_rtcp_addr
             {
@@ -6037,7 +5952,7 @@ impl PeerConnectionInner {
                     sender.cname(),
                     sender.stream_id(),
                     sender.track_id(),
-                    &mode,
+                    keying,
                     sender_rtx_ssrc,
                 );
             } else if direction.sends()
@@ -6060,12 +5975,12 @@ impl PeerConnectionInner {
                     &cname,
                     &stream_id,
                     &track_id,
-                    &mode,
+                    keying,
                     sender_rtx_ssrc,
                 );
             }
 
-            if self.config.transport_mode == TransportMode::Srtp {
+            if keying == Keying::Sdes {
                 // RFC 4568 §7.1.2: an answer echoes the selected offer
                 // crypto's suite and tag (and lifetime); we deliberately do
                 // NOT echo (or advertise) an MKI — see negotiate_sdes_mki.
@@ -6151,7 +6066,7 @@ impl PeerConnectionInner {
         cname: &str,
         stream_id: &str,
         track_id: &str,
-        mode: &TransportMode,
+        keying: Keying,
         rtx_ssrc: Option<u32>,
     ) {
         // MSID is signalled exactly once, via the a=ssrc msid: attribute below
@@ -6169,7 +6084,7 @@ impl PeerConnectionInner {
             Some(format!("{} cname:{}", ssrc, cname)),
         ));
 
-        if *mode == TransportMode::WebRtc {
+        if keying == Keying::Dtls {
             section.attributes.push(Attribute::new(
                 "ssrc",
                 Some(format!("{} msid:{} {}", ssrc, stream_id, track_id)),
@@ -6181,7 +6096,7 @@ impl PeerConnectionInner {
                 "ssrc",
                 Some(format!("{} cname:{}", rtx, cname)),
             ));
-            if *mode == TransportMode::WebRtc {
+            if keying == Keying::Dtls {
                 section.attributes.push(Attribute::new(
                     "ssrc",
                     Some(format!("{} msid:{} {}", rtx, stream_id, track_id)),
@@ -6237,11 +6152,15 @@ impl PeerConnectionInner {
         // Browsers reject descriptions with duplicate extension ids.
         let mut used_extmap_ids = self.get_remote_extmap_ids(&section.mid);
 
+        // Offers claim ids for WebRTC header extensions (rid, abs-send-time,
+        // sdes:mid) only on WebRTC (DTLS) legs: SIP peers, plain RTP or
+        // SDES-SRTP, do not use them. Answers echo whatever the remote offered.
+
         // Add extmap for Video
         if kind == MediaKind::Video {
             let (mut rid_id, mut repaired_rid_id) = self.get_remote_video_extmap_ids(&section.mid);
 
-            if sdp_type == SdpType::Offer && self.config.transport_mode != TransportMode::Rtp {
+            if sdp_type == SdpType::Offer && self.config.keying() == Keying::Dtls {
                 // If not found in remote (new transceiver), use defaults
                 if rid_id.is_none() {
                     rid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 1));
@@ -6259,7 +6178,7 @@ impl PeerConnectionInner {
             self.get_remote_extmap_id(&section.mid, crate::sdp::ABS_SEND_TIME_URI);
         if sdp_type == SdpType::Offer
             && abs_send_time_id.is_none()
-            && self.config.transport_mode != TransportMode::Rtp
+            && self.config.keying() == Keying::Dtls
         {
             abs_send_time_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 3));
         }
@@ -6272,7 +6191,7 @@ impl PeerConnectionInner {
 
         // Add transport-cc extmap (TWCC sequence numbers + feedback) when the
         // GCC loop is enabled. Answers echo the remote id; offers claim one.
-        if self.config.enable_gcc && self.config.transport_mode == TransportMode::WebRtc {
+        if self.config.enable_gcc && self.config.keying() == Keying::Dtls {
             let mut transport_cc_id =
                 self.get_remote_extmap_id(&section.mid, crate::sdp::TRANSPORT_CC_URI);
             if sdp_type == SdpType::Offer && transport_cc_id.is_none() {
@@ -6293,7 +6212,7 @@ impl PeerConnectionInner {
             let mut sdes_mid_id = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI);
             if sdp_type == SdpType::Offer
                 && sdes_mid_id.is_none()
-                && self.config.transport_mode != TransportMode::Rtp
+                && self.config.keying() == Keying::Dtls
             {
                 sdes_mid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 4));
             }
@@ -6306,9 +6225,9 @@ impl PeerConnectionInner {
         }
 
         // Only WebRTC uses DTLS-SRTP (a=fingerprint / a=setup). SDES-SRTP
-        // (TransportMode::Srtp) keys via a=crypto and must NOT advertise DTLS
-        // attributes, otherwise SIP/SDES peers (e.g. Twilio) reject the SDP.
-        if self.config.transport_mode == TransportMode::WebRtc {
+        // keys via a=crypto and must NOT advertise DTLS attributes, otherwise
+        // SIP/SDES peers (e.g. Twilio) reject the SDP.
+        if self.config.keying() == Keying::Dtls {
             let setup_value = match sdp_type {
                 SdpType::Offer => "actpass",
                 SdpType::Answer => {
@@ -9075,6 +8994,7 @@ mod tests {
         )
     }
     use super::*;
+    use crate::TransportMode;
     use crate::transports::ice::IceTransportState;
     use crate::{Direction, MediaKind, RtcConfiguration};
 
@@ -10796,6 +10716,37 @@ a=ssrc:67890 cname:foo\r\n";
         assert_eq!(mki.rx_len, None);
     }
 
+    /// WebRTC header extensions (rid, abs-send-time, sdes:mid) are offered
+    /// only on WebRTC (DTLS) legs, not to SIP peers: plain RTP or SDES-SRTP.
+    #[tokio::test]
+    async fn create_offer_webrtc_extmaps_only_with_dtls() {
+        use crate::TransportMode;
+        use crate::config::SdpCompatibilityMode;
+        let offer = |mode: TransportMode| async move {
+            let mut config = RtcConfiguration::default();
+            config.transport_mode = mode;
+            config.sdp_compatibility = SdpCompatibilityMode::Standard;
+            let pc = PeerConnection::new(config);
+            pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+            pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+            let sdp = pc.create_offer().await.unwrap().to_sdp_string();
+            pc.close();
+            sdp
+        };
+        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+            let sdp = offer(mode.clone()).await;
+            assert!(!sdp.contains("a=extmap"), "{mode:?} offer:\n{sdp}");
+        }
+        let sdp = offer(TransportMode::WebRtc).await;
+        for uri in [
+            crate::sdp::ABS_SEND_TIME_URI,
+            crate::sdp::SDES_MID_URI,
+            "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+        ] {
+            assert!(sdp.contains(uri), "WebRTC offer without {uri}:\n{sdp}");
+        }
+    }
+
     #[tokio::test]
     async fn create_offer_srtp_mode_includes_crypto() {
         use crate::TransportMode;
@@ -10863,20 +10814,20 @@ a=ssrc:67890 cname:foo\r\n";
                 IceConn::new(socket_rx, "127.0.0.1:4000".parse().unwrap(), None),
                 true,
             ));
-            pc.setup_sdes(&transport).unwrap();
+            pc.setup_sdes(&transport, 0).unwrap();
             for bad_len in [key_len - 1, key_len + 2] {
                 let bad_key = BASE64_STANDARD.encode(vec![0x33; bad_len]);
                 let bad_sdp = sdp.replace(&encoded, &bad_key);
                 let malformed = SessionDescription::parse(SdpType::Offer, &bad_sdp).unwrap();
                 *pc.inner.remote_description.lock() = Some(malformed.clone());
                 assert!(
-                    pc.setup_sdes(&transport).is_err(),
+                    pc.setup_sdes(&transport, 0).is_err(),
                     "{suite} RX length {bad_len}"
                 );
                 *pc.inner.remote_description.lock() = Some(offer.clone());
                 *pc.inner.local_description.lock() = Some(malformed);
                 assert!(
-                    pc.setup_sdes(&transport).is_err(),
+                    pc.setup_sdes(&transport, 0).is_err(),
                     "{suite} TX length {bad_len}"
                 );
                 *pc.inner.local_description.lock() = Some(answer.clone());
@@ -13901,6 +13852,180 @@ a=mid:0
             *video_transport.ice_conn().remote_rtcp_addr.read(),
             Some(SocketAddr::new(remote_ip, 6001))
         );
+    }
+
+    /// SDES-SRTP uses the same direct transports as plain RTP: one per m-line
+    /// without BUNDLE, each keyed with its own m-line's a=crypto (RFC 4568).
+    #[tokio::test]
+    async fn srtp_mode_non_bundle_keys_each_media_transport() {
+        use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![crate::config::VideoCapability::h264()],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/SAVP 8\r\n\
+            a=rtcp:5001\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+            a=sendrecv\r\n\
+            m=video 6000 RTP/SAVP 103\r\n\
+            a=rtcp:6001\r\n\
+            a=rtpmap:103 H264/90000\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNk\r\n\
+            a=sendrecv\r\n";
+
+        let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let sdp = answer.to_sdp_string();
+        let (audio, video) = (&answer.media_sections[0], &answer.media_sections[1]);
+        assert_ne!(audio.port, video.port, "{sdp}");
+        assert_eq!(sdp.matches("a=rtcp:").count(), 2, "{sdp}");
+        let keys: Vec<String> = answer
+            .media_sections
+            .iter()
+            .map(|m| m.get_crypto_attributes()[0].key_params.clone())
+            .collect();
+        assert_ne!(keys[0], keys[1], "each m-line has its own key:\n{sdp}");
+        assert!(!sdp.contains("a=fingerprint"), "{sdp}");
+
+        let remote_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let primary = pc.inner.rtp_transport.lock().clone().unwrap();
+        assert_eq!(
+            *primary.ice_conn().remote_addr.read(),
+            SocketAddr::new(remote_ip, 5000)
+        );
+        let video_t = pc
+            .get_transceivers()
+            .into_iter()
+            .find(|t| t.kind() == MediaKind::Video)
+            .unwrap();
+        let video_transport = pc
+            .inner
+            .rtp_media_transports
+            .lock()
+            .get(&video_t.id())
+            .cloned()
+            .expect("video should have its own transport");
+        assert_eq!(
+            *video_transport.ice_conn().remote_addr.read(),
+            SocketAddr::new(remote_ip, 6000)
+        );
+        assert!(video_transport.has_srtp(), "video transport keyed");
+        // Video's own keys: midless SDP must not fall back to audio's.
+        let (local, remote) = pc.sdes_crypto(1);
+        assert_eq!(
+            remote.unwrap().key_params,
+            "inline:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNk"
+        );
+        assert_eq!(local.unwrap().key_params, keys[1]);
+        // The primary transport is keyed when it starts (start_dtls).
+        for _ in 0..100 {
+            if primary.has_srtp() {
+                break;
+            }
+            crate::platform::task::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        assert!(primary.has_srtp(), "audio transport keyed");
+        pc.close();
+    }
+
+    /// An SDES-SRTP offer with an IPv6 c= line starts the direct transport
+    /// like an IPv4 one (Linphone on a dual-stack mobile network).
+    #[tokio::test]
+    async fn srtp_mode_offer_with_ipv6_connection_starts_transport() {
+        use crate::TransportMode;
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP6 2001:db8::1\r\n\
+            s=-\r\n\
+            c=IN IP6 2001:db8::1\r\n\
+            t=0 0\r\n\
+            m=audio 52115 RTP/SAVP 0\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+        let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        assert_eq!(
+            pc.inner.ice_transport.state(),
+            crate::transports::ice::IceTransportState::Connected
+        );
+        assert_eq!(
+            pc.inner
+                .ice_transport
+                .get_selected_pair()
+                .unwrap()
+                .remote
+                .address,
+            "[2001:db8::1]:52115"
+                .parse::<core::net::SocketAddr>()
+                .unwrap()
+        );
+        pc.close();
+    }
+
+    /// `enable_ice_lite` applies to SDES-SRTP like plain RTP.
+    #[tokio::test]
+    async fn srtp_mode_ice_lite_answer_has_ice_attributes() {
+        use crate::TransportMode;
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 4000 RTP/SAVP 0\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=ice-ufrag:phon\r\n\
+            a=ice-pwd:phonepasswordphonepassword\r\n\
+            a=candidate:1 1 UDP 2130706431 127.0.0.1 4000 typ host\r\n\
+            a=sendrecv\r\n";
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        config.enable_ice_lite = true;
+        let pc = PeerConnection::new(config);
+        let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let sdp = pc.create_answer().await.unwrap().to_sdp_string();
+        for attr in [
+            "a=ice-lite",
+            "a=ice-ufrag:",
+            "a=ice-pwd:",
+            "a=candidate:",
+            "a=crypto:",
+        ] {
+            assert!(sdp.contains(attr), "{attr} missing:\n{sdp}");
+        }
+        assert_eq!(
+            pc.inner.ice_transport.role(),
+            crate::transports::ice::IceRole::Controlled
+        );
+        pc.close();
     }
 
     #[tokio::test]

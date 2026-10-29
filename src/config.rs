@@ -108,6 +108,40 @@ pub enum TransportMode {
     Rtp,
 }
 
+/// How the media path to the peer is found. Derived from
+/// [`TransportMode`] and `enable_ice_lite` by
+/// [`RtcConfiguration::connectivity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Connectivity {
+    /// The c=/m= address of the peer's SDP (corrected by latching, when on).
+    /// A direct transport: no ICE agent.
+    Sdp,
+    /// ICE-lite (RFC 8445 §2.5): a direct transport that answers the full-ICE
+    /// peer's checks and follows its nomination.
+    IceLite,
+    /// Full ICE: gathering, connectivity checks, nomination.
+    Ice,
+}
+
+impl Connectivity {
+    /// A direct transport (no full ICE agent): `Sdp` or `IceLite`.
+    pub(crate) fn is_direct(self) -> bool {
+        self != Connectivity::Ice
+    }
+}
+
+/// How the SRTP keys are exchanged. Derived from [`TransportMode`] by
+/// [`RtcConfiguration::keying`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keying {
+    /// Plain RTP (RTP/AVP).
+    None,
+    /// SDES, `a=crypto` (RFC 4568), RTP/SAVP.
+    Sdes,
+    /// DTLS-SRTP, `a=fingerprint` (RFC 5763/5764), UDP/TLS/RTP/SAVPF.
+    Dtls,
+}
+
 /// Strategy for dropping packets when buffer is full.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BufferDropStrategy {
@@ -747,6 +781,29 @@ impl PartialEq for RtcConfiguration {
 }
 
 impl Eq for RtcConfiguration {}
+
+impl RtcConfiguration {
+    /// How the media path is found. `enable_ice_lite` applies to the direct
+    /// modes (RTP, SRTP); WebRTC always runs full ICE.
+    pub(crate) fn connectivity(&self) -> Connectivity {
+        match self.transport_mode {
+            TransportMode::WebRtc => Connectivity::Ice,
+            TransportMode::Rtp | TransportMode::Srtp if self.enable_ice_lite => {
+                Connectivity::IceLite
+            }
+            TransportMode::Rtp | TransportMode::Srtp => Connectivity::Sdp,
+        }
+    }
+
+    /// How the SRTP keys are exchanged.
+    pub(crate) fn keying(&self) -> Keying {
+        match self.transport_mode {
+            TransportMode::Rtp => Keying::None,
+            TransportMode::Srtp => Keying::Sdes,
+            TransportMode::WebRtc => Keying::Dtls,
+        }
+    }
+}
 
 impl Default for RtcConfiguration {
     fn default() -> Self {

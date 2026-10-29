@@ -660,6 +660,11 @@ impl RtpTransport {
         self.transport.clone()
     }
 
+    /// Whether SRTP keys are set (`start_srtp`).
+    pub(crate) fn has_srtp(&self) -> bool {
+        self.srtp_session.lock().is_some()
+    }
+
     pub fn start_srtp(&self, srtp_session: SrtpSession) {
         let mut session = self.srtp_session.lock();
         *session = Some(Arc::new(Mutex::new(srtp_session)));
