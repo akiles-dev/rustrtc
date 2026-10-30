@@ -1149,11 +1149,15 @@ impl IceTransportRunner {
                             let _ = socket.send_to(&bytes, pair.remote.address).await;
                             return Some(cleanup);
                         }
-                    } else if inner.config.connectivity().is_direct()
-                        && let Ok(bytes) = msg.encode(None, false)
-                    {
-                        let _ = socket.send_to(&bytes, pair.remote.address).await;
                     }
+                    // No ICE parameters from the peer: it does no ICE (a plain
+                    // RTP trunk, a phone without ICE), so send no STUN. With
+                    // such a peer, ICE is not in use for the session (RFC 8839
+                    // §4.3.3), and keepalives must use a format the peer
+                    // supports (RFC 8445 §11): a STUN request lands in its
+                    // RTP stream as a bad packet. RTCP goes on also on hold
+                    // (RFC 3264 §5.1). Not covered: our own NAT binding of the
+                    // RTP port while we send no RTP (RFC 6263 keepalives).
                 }
             }
         }
