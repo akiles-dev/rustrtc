@@ -1184,6 +1184,52 @@ async fn test_keepalive_tick_repairs_stranded_checking_with_selected_pair() -> R
     Ok(())
 }
 
+/// A peer without ICE (no ICE parameters: a plain RTP trunk) gets no STUN
+/// keepalive: ICE is not in use with it (RFC 8839 §4.3.3), and a STUN
+/// request is no format it supports (RFC 8445 §11). A peer with ICE
+/// parameters still gets one.
+#[tokio::test]
+async fn test_keepalive_only_to_ice_peers() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = crate::TransportMode::Rtp;
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    transport.start_gathering()?;
+    let local = {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(c) = transport.local_candidates().first() {
+                break c.clone();
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(5),
+                "no host candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let remote = IceCandidate::host(peer.local_addr()?, 1);
+    *transport.inner.selected_pair.lock() = Some(IceCandidatePair::new(local, remote));
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+    let mut buf = [0u8; 1500];
+
+    IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert!(
+        timeout(Duration::from_millis(300), peer.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "no STUN to a peer without ICE"
+    );
+
+    transport.set_remote_parameters(IceParameters::new("remote-ufrag", "remote-pwd"));
+    IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf)).await??;
+    assert!(n >= 20 && buf[0] < 4, "a STUN request to a peer with ICE");
+    Ok(())
+}
+
 /// The incident mechanism, end to end against a real TURN server: after a
 /// hold renegotiation (`start` with UNCHANGED credentials) the TURN refresh
 /// timer must keep refreshing the allocation. Pre-fix, the renegotiation
