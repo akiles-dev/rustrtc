@@ -3678,6 +3678,25 @@ async fn verify_nominated_path(
     }
 }
 
+/// Whether `sender` is the RTCP socket (ICE component 2) of a direct
+/// transport without rtcp-mux.
+fn is_rtcp_component_socket(sender: &IceSocketWrapper, inner: &IceTransportInner) -> bool {
+    let local = match sender {
+        IceSocketWrapper::Platform(s) => s.local_addr().ok(),
+        IceSocketWrapper::Udp(s) => s.local_addr().ok(),
+        IceSocketWrapper::SharedUdp(h) => h.local_addr().ok(),
+        _ => None,
+    };
+    let Some(local) = local else {
+        return false;
+    };
+    inner
+        .gatherer
+        .local_candidates()
+        .iter()
+        .any(|c| c.component != 1 && c.base_address() == local)
+}
+
 async fn handle_stun_request(
     sender: &IceSocketWrapper,
     msg: &StunDecoded,
@@ -3701,6 +3720,21 @@ async fn handle_stun_request(
         }
     } else {
         debug!("Failed to encode STUN Response");
+    }
+
+    // Without rtcp-mux, a direct transport has a second socket for RTCP
+    // (component 2), and a full-ICE peer (Linphone) checks and nominates it
+    // too. Its checks are answered above, but they say nothing about where
+    // RTP goes: discovery, latching and nomination below are for the RTP
+    // component. A nomination here used to become the media pair, so RTP
+    // went out of our RTCP socket to the peer's RTCP port. Where RTCP goes is
+    // RTCP latching's job.
+    if is_rtcp_component_socket(sender, &inner) {
+        trace!(
+            "STUN request on the RTCP component from {}: answered only",
+            addr
+        );
+        return;
     }
 
     // Check if we know this candidate
