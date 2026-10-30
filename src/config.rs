@@ -550,6 +550,9 @@ pub struct RtcConfiguration {
     pub external_port: Option<u16>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
+    /// The SSRC of the first sender; later senders count up from it. Random
+    /// by default, as RFC 3550 §8.1 asks: a fixed start gives every peer
+    /// connection the same SSRCs.
     pub ssrc_start: u32,
     pub stun_timeout: core::time::Duration,
     /// Upper bound on STUN/TURN *server* candidate gathering. A slow or hung
@@ -822,7 +825,7 @@ impl Default for RtcConfiguration {
             external_port: None,
             bind_ip: None,
             disable_ipv6: false,
-            ssrc_start: 10000,
+            ssrc_start: crate::transports::ice::stun::random_u32(),
             stun_timeout: core::time::Duration::from_secs(5),
             ice_gather_timeout: core::time::Duration::ZERO,
             nomination_timeout: core::time::Duration::from_secs(10),
@@ -1268,6 +1271,16 @@ impl From<RtcConfigurationBuilder> for RtcConfiguration {
 mod tests {
     use super::*;
     use core::time::Duration;
+
+    #[test]
+    fn default_ssrc_start_is_random() {
+        // Two peer connections must not share SSRCs by default. (A false
+        // failure needs two equal random u32s: 1 in 2^32.)
+        assert_ne!(
+            RtcConfiguration::default().ssrc_start,
+            RtcConfiguration::default().ssrc_start
+        );
+    }
 
     #[test]
     fn test_rtc_configuration_defaults() {
