@@ -269,6 +269,9 @@ pub struct StatsCollector {
     last_rr_sent: Mutex<Option<Instant>>,
     /// Monotonic counter used only to pace RR emission.
     packets_since_rr: AtomicU64,
+    /// The SSRC of our first sender, known before it sends anything: the
+    /// SSRC an RR carries as its sender's (see `add_local_source`).
+    local_ssrc: Mutex<Option<u32>>,
 }
 
 /// Bound a per-SSRC stats map so long-lived SSRC churn (re-INVITE, simulcast
@@ -312,6 +315,14 @@ impl StatsCollector {
     // Delay units are 1/65536 seconds as per RFC 3550 §6.4.1
     fn dlsr_to_secs(dlsr: u32) -> f64 {
         dlsr as f64 / 65536.0
+    }
+
+    /// A sender of ours exists with this SSRC. The RRs we send carry the
+    /// SSRC of their sender (RFC 3550 §6.4.2), also before we send any RTP:
+    /// early media comes in before the call is answered. Without this they
+    /// said 0 until our first packet went out.
+    pub(crate) fn add_local_source(&self, ssrc: u32) {
+        self.local_ssrc.lock().get_or_insert(ssrc);
     }
 
     pub fn record_sr_sent(&self, _ssrc: u32, compact_ntp: u32) {
@@ -444,12 +455,9 @@ impl StatsCollector {
         if blocks.is_empty() {
             return None;
         }
-        let sender_ssrc = self
-            .local_outbound
-            .lock()
-            .keys()
-            .next()
-            .copied()
+        // 0 only for a peer connection with no sender at all.
+        let sender_ssrc = (*self.local_ssrc.lock())
+            .or_else(|| self.local_outbound.lock().keys().next().copied())
             .unwrap_or(0);
         *self.last_rr_sent.lock() = Some(Instant::now());
         self.packets_since_rr.store(0, Ordering::Relaxed);
@@ -706,6 +714,25 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].ssrc, 42);
         assert!(blocks[0].packets_lost >= 4);
+    }
+
+    #[test]
+    fn early_rr_carries_our_ssrc() {
+        // Early media: 50 packets come in before we send anything.
+        let collector = StatsCollector::new();
+        collector.add_local_source(4242);
+        let mut header = crate::rtp::RtpHeader::new(8, 1, 0, 77);
+        let mut report = None;
+        for seq in 1u16..=50 {
+            header.sequence_number = seq;
+            header.timestamp = seq as u32 * 160;
+            let packet = RtpPacket::new(header.clone(), vec![0u8; 160]);
+            report = report.or(collector.observe_packet(&packet, 8000));
+        }
+        match report {
+            Some(RtcpPacket::ReceiverReport(rr)) => assert_eq!(rr.sender_ssrc, 4242),
+            other => panic!("expected an RR, got {other:?}"),
+        }
     }
 
     /// Run the jitter estimate over (arrival delta, RTP timestamp delta)

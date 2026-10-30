@@ -1481,6 +1481,7 @@ impl PeerConnection {
         };
         let ssrc = (*transceiver.sender_ssrc.lock())
             .unwrap_or_else(|| self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed));
+        self.inner.stats_collector.add_local_source(ssrc);
 
         let mut builder = RtpSenderBuilder::new(track, ssrc)
             .stream_id(stream_id)
