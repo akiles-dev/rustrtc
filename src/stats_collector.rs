@@ -160,6 +160,7 @@ impl LocalInboundStats {
                 self.jitter_q4,
                 arrival_units.wrapping_sub(self.last_arrival_rtp),
                 rtp_ts.wrapping_sub(self.last_rtp_ts),
+                self.clock_rate,
             );
             self.jitter = self.jitter_q4 >> 4;
         } else {
@@ -226,6 +227,9 @@ fn arrival_units(since_start: core::time::Duration, clock_rate: u32) -> u32 {
     (since_start.as_secs_f64() * clock_rate as f64) as u64 as u32
 }
 
+/// See `jitter_step`.
+const JITTER_MAX_D_SECS: i64 = 5;
+
 /// One step of the RFC 3550 A.8 jitter estimate, J += (|D| - J) / 16, with
 /// J times 16 (`jitter_q4`) as in the RFC's fixed-point code. With J in
 /// whole units, the integer division dropped every change under 16 units
@@ -234,8 +238,20 @@ fn arrival_units(since_start: core::time::Duration, clock_rate: u32) -> u32 {
 /// The two deltas are wrapping differences of the arrival times and of the
 /// RTP timestamps: an RTP timestamp starts at random, so it can wrap in any
 /// call, and a plain difference made one huge D there.
-fn jitter_step(jitter_q4: u32, arrival_delta: u32, rtp_ts_delta: u32) -> u32 {
+///
+/// A D of more than `JITTER_MAX_D_SECS` is skipped (J stays as it is; the
+/// caller still moves on to this packet, so the next one compares against
+/// it). Such a D is a jump of the sender's RTP timestamp within one SSRC,
+/// not jitter: an SBC that goes from early media to the answered call can
+/// keep the SSRC and the sequence numbers and start a new timestamp base.
+/// Seen with Netelip: one D of about 16 hours put J at an hour, and it took
+/// seconds to decay. libwebrtc skips these too ("crazy jumps in TS for the
+/// same stream", 5 s at 90 kHz). A network stall that long is skipped too.
+fn jitter_step(jitter_q4: u32, arrival_delta: u32, rtp_ts_delta: u32, clock_rate: u32) -> u32 {
     let d = (arrival_delta as i32 as i64) - (rtp_ts_delta as i32 as i64);
+    if d.abs() > JITTER_MAX_D_SECS * clock_rate as i64 {
+        return jitter_q4;
+    }
     let j = jitter_q4 as i64;
     (j + d.abs() - ((j + 8) >> 4)).clamp(0, u32::MAX as i64) as u32
 }
@@ -713,7 +729,7 @@ mod tests {
     fn run_jitter(steps: impl IntoIterator<Item = (u32, u32)>) -> u32 {
         let mut q4 = 0;
         for (arrival, ts) in steps {
-            q4 = jitter_step(q4, arrival, ts);
+            q4 = jitter_step(q4, arrival, ts, 8000);
         }
         q4 >> 4
     }
@@ -727,6 +743,20 @@ mod tests {
         assert_eq!(run_jitter(steps), 7);
         // Perfect pacing: no jitter.
         assert_eq!(run_jitter((0..500).map(|_| (160, 160))), 0);
+    }
+
+    #[test]
+    fn jitter_skips_timestamp_jumps() {
+        // 8 kHz, 20 ms packets, 0.5 ms early and late in turn: J tends to 8.
+        let normal = |n| (0..n).map(|i| (if i % 2 == 0 { 168 } else { 152 }, 160));
+        // Then the sender's timestamp jumps by about 16 hours (Netelip at the
+        // answer), then the stream goes on as before from the new base.
+        let jump = 160u32.wrapping_add(455_000_000);
+        let steps = normal(500).chain([(160, jump)]).chain(normal(100));
+        assert_eq!(run_jitter(steps), 7, "the jump is no jitter");
+        // A D under 5 s still counts: a 4 s stall puts J at 4 s / 16.
+        let stall = normal(500).chain([(160 + 4 * 8000, 160)]);
+        assert_eq!(run_jitter(stall), 7 + 4 * 8000 / 16);
     }
 
     #[test]
