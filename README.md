@@ -229,6 +229,11 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`ice_udp_mux`** / **`ice_udp_mux_port`** — Share a single UDP socket across many `PeerConnection`s (single-port multiplexing for SFU/WHEP). Set `ice_udp_mux = true` and `ice_udp_mux_port = <port>`; incoming packets are demuxed by the server ufrag in the STUN Binding Request, then by remote source address.
 - **`enable_mdns`** — Advertise host candidates via mDNS (`<random>.local` hostnames instead of local IPs, draft-ietf-rtcweb-mdns). A built-in mDNS responder answers A/AAAA lookups; real addresses are kept internally so connectivity is unaffected. Default: `false`.
 
+### SDES Keying (Srtp mode)
+Re-INVITE renegotiation keeps the call keyed without restarting media:
+- **Answers keep our key** — a re-INVITE answer reuses the key we are already sending with, so the peer does not drop our audio mid-call. A new key is generated only when the crypto suite changes.
+- **Peer key changes are applied** — if the peer offers a new key at the same suite, the SRTP/SRTCP sessions are re-keyed once the offer/answer exchange completes (signaling back at `Stable`); packets in flight under the old key may be dropped during the switchover.
+
 ### Bandwidth Estimation (GCC)
 - **`enable_gcc`** — TWCC + GCC loop (default: `true`): outbound RTP is stamped with transport-cc sequence numbers, TWCC feedback is generated for inbound streams, and each `RtpSender` publishes a bandwidth estimate. The library does not throttle sends itself — drive your encoder from `RtpSender::subscribe_target_bitrate()`:
 
@@ -276,7 +281,7 @@ Note: persistence-based latching is accident-robustness (stale NAT bindings, por
 
 ### Media Capabilities
 - **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`.
-- **`ssrc_start`** — Starting SSRC value for local tracks.
+- **`ssrc_start`** — Starting SSRC value for local tracks (later tracks count up from it). Random by default per RFC 3550 §8.1; pin it only if your deployment needs deterministic SSRCs. Note: two default configs therefore never compare equal via `PartialEq`.
 - **`depacketizer_strategy`** — Pluggable per-kind depacketizer (e.g. `Vp9Depacketizer` for RFC 9628 VP9 reassembly).
 
 ### SCTP (Data Channels)

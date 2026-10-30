@@ -14113,6 +14113,74 @@ a=mid:0
         pc.close();
     }
 
+    /// A re-INVITE that changes the crypto suite: the key cannot carry over
+    /// across profiles, so the answer carries a newly generated key, and the
+    /// next offer with the old suite again starts fresh. Only the same suite
+    /// reuses our key.
+    #[tokio::test]
+    async fn srtp_mode_reinvite_suite_change_generates_a_new_key() {
+        use crate::TransportMode;
+        let offer = |version: u32, suite: &str, key: &str| {
+            let sdp = format!(
+                "v=0\r\n\
+                 o=- 1 {version} IN IP4 127.0.0.1\r\n\
+                 s=-\r\n\
+                 c=IN IP4 127.0.0.1\r\n\
+                 t=0 0\r\n\
+                 m=audio 4000 RTP/SAVP 0\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=crypto:1 {suite} inline:{key}\r\n\
+                 a=sendrecv\r\n"
+            );
+            SessionDescription::parse(SdpType::Offer, &sdp).unwrap()
+        };
+        let crypto = |answer: &SessionDescription| {
+            answer.media_sections[0].get_crypto_attributes()[0].clone()
+        };
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+
+        let key = "a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK";
+        pc.set_remote_description(
+            offer(1, "AES_CM_128_HMAC_SHA1_80", key),
+        )
+        .await
+        .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        let first = crypto(&answer);
+        assert_eq!(first.crypto_suite, "AES_CM_128_HMAC_SHA1_80");
+        assert!(first.key_params.starts_with("inline:"));
+
+        // The same suite again: our key is kept (see the rekey test).
+        pc.set_remote_description(
+            offer(2, "AES_CM_128_HMAC_SHA1_80", "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNk"),
+        )
+        .await
+        .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        assert_eq!(crypto(&answer).key_params, first.key_params);
+
+        // A different suite (same key length): the old key must not carry
+        // over, a new one is generated for the new profile.
+        pc.set_remote_description(
+            offer(3, "AES_CM_128_HMAC_SHA1_32", key),
+        )
+        .await
+        .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        let third = crypto(&answer);
+        assert_eq!(third.crypto_suite, "AES_CM_128_HMAC_SHA1_32");
+        assert_ne!(
+            third.key_params, first.key_params,
+            "a new key for the new suite"
+        );
+        pc.close();
+    }
+
     /// `enable_ice_lite` applies to SDES-SRTP like plain RTP.
     #[tokio::test]
     async fn srtp_mode_ice_lite_answer_has_ice_attributes() {

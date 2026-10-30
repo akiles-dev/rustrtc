@@ -751,6 +751,41 @@ mod tests {
         }
     }
 
+    /// A peer connection with senders but no `add_local_source` call site
+    /// reachable: the RR falls back to the SSRC we actually send with
+    /// (the only source before #77), never 0.
+    #[tokio::test]
+    async fn rr_sender_ssrc_falls_back_to_the_first_outbound() {
+        let collector = StatsCollector::new();
+        let mut header = crate::rtp::RtpHeader::new(8, 1, 0, 77);
+        let mut report = None;
+        for seq in 1u16..=49 {
+            header.sequence_number = seq;
+            header.timestamp = seq as u32 * 160;
+            let packet = RtpPacket::new(header.clone(), vec![0u8; 160]);
+            report = report.or(collector.observe_packet(&packet, 8000));
+        }
+        // Our first outbound packet registers the sender SSRC.
+        let mut out_header = crate::rtp::RtpHeader::new(8, 1, 0, 4242);
+        out_header.sequence_number = 1;
+        out_header.timestamp = 160;
+        let packet = RtpPacket::new(out_header, vec![0u8; 160]);
+        collector
+            .on_packet_sent(&packet, test_addr(), test_addr())
+            .await;
+        header.sequence_number = 50;
+        header.timestamp = 50 * 160;
+        let packet = RtpPacket::new(header, vec![0u8; 160]);
+        report = report.or(collector.observe_packet(&packet, 8000));
+        match report {
+            Some(RtcpPacket::ReceiverReport(rr)) => {
+                assert_eq!(rr.sender_ssrc, 4242, "fallback to the outbound SSRC");
+                assert_eq!(rr.report_blocks.len(), 1);
+            }
+            other => panic!("expected an RR, got {other:?}"),
+        }
+    }
+
     /// Run the jitter estimate over (arrival delta, RTP timestamp delta)
     /// steps. Returns J in units.
     fn run_jitter(steps: impl IntoIterator<Item = (u32, u32)>) -> u32 {
@@ -784,6 +819,22 @@ mod tests {
         // A D under 5 s still counts: a 4 s stall puts J at 4 s / 16.
         let stall = normal(500).chain([(160 + 4 * 8000, 160)]);
         assert_eq!(run_jitter(stall), 7 + 4 * 8000 / 16);
+    }
+
+    #[test]
+    fn jitter_jump_threshold_scales_with_clock_rate() {
+        // The 5 s jump threshold is in units of the stream's own clock, not
+        // a fixed rate: the same wall-clock stall counts at any clock rate,
+        // and a jump is skipped once it passes 5 s.
+        // 90 kHz: a 3 s stall (D = 270000) is under the threshold, J = D / 16.
+        let stall = jitter_step(0, 3 * 90_000, 0, 90_000);
+        assert_eq!(stall >> 4, 3 * 90_000 / 16);
+        // Exactly 5 s is on the counted side, as in libwebrtc.
+        let boundary = jitter_step(0, 5 * 90_000, 0, 90_000);
+        assert_eq!(boundary >> 4, 5 * 90_000 / 16);
+        // Just over: skipped, J keeps its previous value.
+        let skipped = jitter_step(1234 << 4, 5 * 90_000 + 1, 0, 90_000);
+        assert_eq!(skipped, 1234 << 4);
     }
 
     #[test]
