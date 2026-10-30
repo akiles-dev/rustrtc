@@ -91,6 +91,8 @@ struct LocalInboundStats {
     initialized: bool,
     /// Interarrival jitter estimate (RTP timestamp units).
     jitter: u32,
+    /// The same, times 16: RFC 3550 A.8 fixed point (see `jitter_step`).
+    jitter_q4: u32,
     last_rtp_ts: u32,
     last_arrival_rtp: u32,
     transit_init: bool,
@@ -110,6 +112,7 @@ impl Default for LocalInboundStats {
             cycles: 0,
             initialized: false,
             jitter: 0,
+            jitter_q4: 0,
             last_rtp_ts: 0,
             last_arrival_rtp: 0,
             transit_init: false,
@@ -143,17 +146,22 @@ impl LocalInboundStats {
         self.packets_received += 1;
 
         // RFC 3550 A.8 interarrival jitter (arrival in RTP timestamp units).
-        static START: crate::platform::sync::OnceLock<Instant> =
+        // The arrival time comes from `RttInstant`: on std the monotonic
+        // clock, not the platform `Instant`, which is whole milliseconds
+        // (8 units at 8 kHz, as much as the jitter of a good network).
+        static START: crate::platform::sync::OnceLock<RttInstant> =
             crate::platform::sync::OnceLock::new();
-        let start = START.get_or_init(Instant::now);
+        let start = START.get_or_init(RttInstant::now);
         let arrival_units =
-            (now.duration_since(*start).as_secs_f64() * self.clock_rate as f64) as u32;
+            arrival_units(RttInstant::now().duration_since(*start), self.clock_rate);
 
         if self.transit_init {
-            let d = (arrival_units as i64 - self.last_arrival_rtp as i64)
-                - (rtp_ts as i64 - self.last_rtp_ts as i64);
-            let ad = d.unsigned_abs() as i64;
-            self.jitter = ((self.jitter as i64) + ((ad - self.jitter as i64) / 16)) as u32;
+            self.jitter_q4 = jitter_step(
+                self.jitter_q4,
+                arrival_units.wrapping_sub(self.last_arrival_rtp),
+                rtp_ts.wrapping_sub(self.last_rtp_ts),
+            );
+            self.jitter = self.jitter_q4 >> 4;
         } else {
             self.transit_init = true;
         }
@@ -208,6 +216,28 @@ impl LocalInboundStats {
             delay_since_last_sender_report: delay_since_last_sr,
         }
     }
+}
+
+/// The arrival time in RTP timestamp units, modulo 2^32 like an RTP
+/// timestamp. A plain `as u32` saturates: after 2^32 units of process
+/// uptime (24.8 hours at 48 kHz) the arrival time stopped, and every packet
+/// interval counted as jitter.
+fn arrival_units(since_start: core::time::Duration, clock_rate: u32) -> u32 {
+    (since_start.as_secs_f64() * clock_rate as f64) as u64 as u32
+}
+
+/// One step of the RFC 3550 A.8 jitter estimate, J += (|D| - J) / 16, with
+/// J times 16 (`jitter_q4`) as in the RFC's fixed-point code. With J in
+/// whole units, the integer division dropped every change under 16 units
+/// (2 ms at 8 kHz): the estimate stayed at 0 on a good network.
+///
+/// The two deltas are wrapping differences of the arrival times and of the
+/// RTP timestamps: an RTP timestamp starts at random, so it can wrap in any
+/// call, and a plain difference made one huge D there.
+fn jitter_step(jitter_q4: u32, arrival_delta: u32, rtp_ts_delta: u32) -> u32 {
+    let d = (arrival_delta as i32 as i64) - (rtp_ts_delta as i32 as i64);
+    let j = jitter_q4 as i64;
+    (j + d.abs() - ((j + 8) >> 4)).clamp(0, u32::MAX as i64) as u32
 }
 
 #[derive(Debug, Clone)]
@@ -676,5 +706,42 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].ssrc, 42);
         assert!(blocks[0].packets_lost >= 4);
+    }
+
+    /// Run the jitter estimate over (arrival delta, RTP timestamp delta)
+    /// steps. Returns J in units.
+    fn run_jitter(steps: impl IntoIterator<Item = (u32, u32)>) -> u32 {
+        let mut q4 = 0;
+        for (arrival, ts) in steps {
+            q4 = jitter_step(q4, arrival, ts);
+        }
+        q4 >> 4
+    }
+
+    #[test]
+    fn jitter_sees_small_differences() {
+        // 8 kHz, packets every 160 units, arriving 4 units (0.5 ms) early and
+        // late in turn: |D| is 8 every time, so J tends to 8. With J in whole
+        // units, (8 - J) / 16 was 0 and J stayed 0.
+        let steps = (0..500).map(|i| (if i % 2 == 0 { 168 } else { 152 }, 160));
+        assert_eq!(run_jitter(steps), 7);
+        // Perfect pacing: no jitter.
+        assert_eq!(run_jitter((0..500).map(|_| (160, 160))), 0);
+    }
+
+    #[test]
+    fn jitter_across_wraps() {
+        // The RTP timestamp wraps between two packets 960 units apart: the
+        // wrapping difference is 960, not -2^32 + 960.
+        let ts_delta = 100u32.wrapping_sub(u32::MAX - 859);
+        assert_eq!(ts_delta, 960);
+        assert_eq!(run_jitter([(960, ts_delta)]), 0);
+        // The arrival time wraps too: after 25 hours at 48 kHz it goes on,
+        // modulo 2^32, instead of stopping at u32::MAX.
+        let day = core::time::Duration::from_secs(25 * 3600);
+        let a = arrival_units(day, 48_000);
+        let b = arrival_units(day + core::time::Duration::from_millis(20), 48_000);
+        assert_ne!(a, u32::MAX);
+        assert_eq!(b.wrapping_sub(a), 960);
     }
 }
