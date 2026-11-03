@@ -277,6 +277,13 @@ pub trait RtpSenderInterceptor: Send + Sync {
     /// Carries the outgoing SSRC and the compact NTP timestamp (middle 32 bits)
     /// so the receiver can compute RTT from LSR/DLSR on the return path.
     fn on_sr_sent(&self, _ssrc: u32, _compact_ntp: u32) {}
+    /// Fires after the sender's RTCP loop sent a report: an SR, or an RR
+    /// while it does not send RTP.
+    fn on_report_sent(&self) {}
+    /// A packet left on our SSRC outside the paced send loop (see
+    /// [`RtpSender::note_external_packet`]); `on_packet_sent` does not
+    /// fire for it.
+    fn on_external_packet_sent(&self, _ssrc: u32, _payload_len: u32) {}
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
     /// Reception report blocks to attach to an outgoing Sender Report (RFC 3550).
     fn reception_report_blocks(&self) -> Vec<crate::rtp::ReportBlock> {
@@ -7755,6 +7762,9 @@ impl RtpSender {
         Self::advance_sampling_timestamp(&self.sampling_timestamp_high_water, timestamp);
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.octets_sent.fetch_add(payload_len, Ordering::Relaxed);
+        for interceptor in &self.interceptors {
+            interceptor.on_external_packet_sent(self.ssrc, payload_len);
+        }
     }
 
     pub fn cname(&self) -> &str {
@@ -7911,6 +7921,10 @@ impl RtpSender {
                 core::time::Duration::from_secs(3),
             );
             rtcp_interval.set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
+            // Packets sent at the last two reports: we are a sender (an SR)
+            // when we sent RTP since the report before the last (RFC 3550
+            // §6.4); else an RR.
+            let mut sent_at_reports = [0u32; 2];
             // seam select5 takes Unpin futures; std's Notified is !Unpin
             let mut notified = core::pin::pin!(stop_rx.notified());
 
@@ -7923,10 +7937,11 @@ impl RtpSender {
                 let __s0 = core::pin::pin!(&mut notified);
                 let __s1 = core::pin::pin!(__tch.changed());
                 // Conditional select! arm becomes either(ticker, pending):
-                // SRs only tick while samples are flowing and RTCP is on.
-                let __s2 = if packets_sent.load(Ordering::Relaxed) > 0
-                    && rtcp_enabled.load(Ordering::Relaxed)
-                {
+                // reports tick while RTCP is on. Always, not only once we
+                // sent a sample: a relayed leg's packets go out on the
+                // rewrite bridge and are counted by note_external_packet,
+                // and nothing would wake this loop to start the ticker.
+                let __s2 = if rtcp_enabled.load(Ordering::Relaxed) {
                     crate::platform::select::Either::A(core::pin::pin!(rtcp_interval.tick()))
                 } else {
                     crate::platform::select::Either::B(core::future::pending::<()>())
@@ -7948,6 +7963,8 @@ impl RtpSender {
                             break;
                         }
                         let packet_count = packets_sent.load(Ordering::Relaxed);
+                        let is_sender = packet_count != sent_at_reports[0];
+                        sent_at_reports = [sent_at_reports[1], packet_count];
 
                         let octet_count = octets_sent.load(Ordering::Relaxed);
                         let rtp_timestamp = last_rtp_timestamp.load(Ordering::Relaxed);
@@ -7960,6 +7977,31 @@ impl RtpSender {
                             let mut seen = alloc::collections::BTreeSet::new();
                             report_blocks.retain(|b| seen.insert(b.ssrc));
                         }
+                        let sdes = crate::rtp::SourceDescription::cname(ssrc, &cname);
+                        if !is_sender {
+                            // Not sending (yet, or on hold): an RR, when
+                            // there is something to report.
+                            if report_blocks.is_empty() {
+                                continue;
+                            }
+                            let rr = crate::rtp::ReceiverReport {
+                                sender_ssrc: ssrc,
+                                report_blocks,
+                            };
+                            if let Err(e) = transport
+                                .send_rtcp(&[
+                                    RtcpPacket::ReceiverReport(rr),
+                                    RtcpPacket::SourceDescription(sdes),
+                                ])
+                                .await
+                            {
+                                trace!("Failed to send Receiver Report: {}", e);
+                            }
+                            for interceptor in &*interceptors {
+                                interceptor.on_report_sent();
+                            }
+                            continue;
+                        }
                         let report = Self::build_sender_report(
                             ssrc,
                             rtp_timestamp,
@@ -7971,7 +8013,6 @@ impl RtpSender {
 
                         let compact_ntp = report.compact_ntp();
                         // A compound packet: the SR, then our CNAME (RFC 3550 §6.1).
-                        let sdes = crate::rtp::SourceDescription::cname(ssrc, &cname);
                         if let Err(e) = transport
                             .send_rtcp(&[
                                 RtcpPacket::SenderReport(report),
@@ -7983,6 +8024,7 @@ impl RtpSender {
                         }
                         for interceptor in &*interceptors {
                             interceptor.on_sr_sent(ssrc, compact_ntp);
+                            interceptor.on_report_sent();
                         }
                     }
                     crate::platform::select::Which5::D(rtcp) => {

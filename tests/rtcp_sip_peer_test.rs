@@ -1,16 +1,19 @@
 #![cfg(feature = "std")]
-//! RTCP towards a plain SIP peer without rtcp-mux (a trunk): the BYE goes
-//! to its RTCP port, and every compound packet starts with a report (RFC
-//! 3550 §6.1).
+//! RTCP towards a plain SIP peer without rtcp-mux (a trunk): the reports
+//! and the BYE go to its RTCP port, every compound packet starts with a
+//! report, and a sender sends SRs only (RFC 3550 §6.1, §6.4).
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use rustrtc::media::frame::{AudioFrame, MediaKind as FrameKind};
 use rustrtc::media::track::sample_track;
-use rustrtc::peer_connection::RtpSender;
-use rustrtc::rtp::{RtcpPacket, is_rtcp, parse_rtcp_packets};
-use std::sync::Arc;
-use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, SessionDescription};
+use rustrtc::peer_connection::{RtpObserver, RtpSender};
+use rustrtc::rtp::{RtcpPacket, RtpPacket, is_rtcp, parse_rtcp_packets};
+use std::sync::{Arc, Weak};
+use rustrtc::{
+    PeerConnection, RtcConfiguration, RtpCodecParameters, RtpRewriteBridgeParams, SdpType,
+    SessionDescription,
+};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
@@ -123,6 +126,24 @@ async fn answer(
     Ok((pc, source, sender))
 }
 
+/// What rustpbx-media does (`OutboundClockSync`): count the packets that
+/// the rewrite bridge sends on the sender's SSRC.
+struct ClockSync(Weak<RtpSender>);
+
+impl RtpObserver for ClockSync {
+    fn on_egress(&self, packet: &RtpPacket, _dst: std::net::SocketAddr) {
+        if let Some(sender) = self.0.upgrade()
+            && packet.header.ssrc == sender.ssrc()
+        {
+            sender.note_external_packet(
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                packet.payload.len() as u32,
+            );
+        }
+    }
+}
+
 fn pcma(seq: u16) -> AudioFrame {
     AudioFrame {
         rtp_timestamp: seq as u32 * 160,
@@ -143,6 +164,62 @@ async fn talk(peer: &Peer, source: Option<&rustrtc::media::track::SampleStreamSo
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A paced sender (transcoding) sends SRs only, every one with the
+/// CNAME, on the peer's RTCP port.
+#[tokio::test]
+async fn sender_sends_only_sender_reports() -> Result<()> {
+    let peer = Peer::new().await;
+    let (pc, source, _) = answer(&peer).await?;
+    let ((reports, _), ()) = tokio::join!(
+        Peer::collect(&peer.rtcp, Duration::from_secs(8)),
+        talk(&peer, Some(&source), Duration::from_secs(8)),
+    );
+    assert!(reports.len() >= 2, "{reports:?}");
+    for r in &reports {
+        assert_eq!(r[0], 200, "a sender's report is an SR: {reports:?}");
+        assert!(r.contains(&202), "with the CNAME: {reports:?}");
+    }
+    pc.close();
+    Ok(())
+}
+
+/// A relayed leg (the rewrite bridge sends its RTP, not its paced sender)
+/// is a sender too: SRs, with the packets that the bridge sent.
+#[tokio::test]
+async fn relay_sender_sends_sender_reports() -> Result<()> {
+    let caller = Peer::new().await;
+    let callee = Peer::new().await;
+    let (a, _a_source, _) = answer(&caller).await?;
+    let (b, _b_source, b_sender) = answer(&callee).await?;
+    b.add_observer(Arc::new(ClockSync(Arc::downgrade(&b_sender))));
+    let params = RtpRewriteBridgeParams {
+        fixed_out_ssrc: Some(b_sender.ssrc()),
+        payload_type: Some(8),
+        ..Default::default()
+    };
+    // The transports attach a moment after the negotiation (rustpbx-media
+    // retries the same way).
+    let mut tries = 0;
+    while let Err(e) = a.bridge_rtp_with_rewrite_to(&b, params) {
+        tries += 1;
+        assert!(tries < 50, "{e}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ((rtcp, rtp), ()) = tokio::join!(
+        Peer::collect(&callee.rtcp, Duration::from_secs(8)),
+        talk(&caller, None, Duration::from_secs(8)),
+    );
+    // The relayed RTP went to the callee's RTP socket, not here.
+    assert_eq!(rtp, 0);
+    assert!(rtcp.len() >= 2, "a relayed leg sends reports: {rtcp:?}");
+    for r in &rtcp {
+        assert_eq!(r[0], 200, "a relayed leg is a sender: SRs: {rtcp:?}");
+    }
+    a.close();
+    b.close();
+    Ok(())
 }
 
 /// At close: one compound RR + SDES + BYE, on the peer's RTCP port, not
